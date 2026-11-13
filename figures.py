@@ -4,7 +4,9 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 from numpy.typing import NDArray
 from sklearn.metrics import precision_recall_curve, roc_curve
 
@@ -17,6 +19,8 @@ from experiment import (
     FOREST,
     RF_COUNTS,
     SVM,
+    SVM_PREFIX,
+    threshold_metrics,
     Evaluation,
     Selection,
     candidates,
@@ -92,6 +96,18 @@ def raw_figures(
     )
 
 
+def threshold_step(
+    ax: Axes,
+    thresholds: NDArray[np.float64],
+    values: NDArray[np.float64],
+    label: str,
+) -> Line2D:
+    # Для >= каждая ступень включает свою правую границу.
+    return ax.step(
+        np.r_[0.0, thresholds, 1.0], np.r_[values[0], values], where="pre", label=label
+    )[0]
+
+
 def selection_figures(
     out: Figures, choices: dict[str, Selection], winner: str, y: NDArray[np.int_]
 ) -> None:
@@ -111,19 +127,19 @@ def selection_figures(
 
     choice = choices[SVM]
     grid = candidates()[SVM].grid
-    matrix = np.empty((len(grid["estimator__C"]), len(grid["estimator__gamma"])))
+    matrix = np.empty((len(grid["C"]), len(grid["gamma"])))
     for params, mean in zip(choice.grid_results["params"], choice.grid_results["mean_test_score"]):
         matrix[
-            grid["estimator__C"].index(params["model__estimator__C"]),
-            grid["estimator__gamma"].index(params["model__estimator__gamma"]),
+            grid["C"].index(params[f"{SVM_PREFIX}C"]),
+            grid["gamma"].index(params[f"{SVM_PREFIX}gamma"]),
         ] = mean
     fig, ax = plt.subplots(figsize=(5.5, 3.4), layout="constrained")
     image = ax.imshow(matrix, cmap="Blues", aspect="auto", vmin=0, vmax=1)
     ax.set(
         xticks=range(3),
-        xticklabels=grid["estimator__gamma"],
+        xticklabels=grid["gamma"],
         yticks=range(3),
-        yticklabels=grid["estimator__C"],
+        yticklabels=grid["C"],
         xlabel="gamma",
         ylabel="C",
     )
@@ -146,16 +162,10 @@ def selection_figures(
     )
 
     choice = choices[winner]
-    precision, recall, thresholds = precision_recall_curve(y, choice.oof)
-    f1 = np.divide(
-        2 * precision * recall,
-        precision + recall,
-        out=np.zeros_like(precision),
-        where=(precision + recall) > 0,
-    )
+    thresholds, precision, recall, f1 = threshold_metrics(y, choice.oof)
     fig, ax = plt.subplots(figsize=(6.7, 3.2), layout="constrained")
     for values, label in [(precision, "Точность"), (recall, "Полнота"), (f1, "F1")]:
-        ax.plot(thresholds, values[:-1], label=label, drawstyle="steps-post")
+        threshold_step(ax, thresholds, values, label)
     ax.axvline(choice.threshold, ls="--", color=".3", label=f"Порог {choice.threshold:.4g}")
     ax.set(xlabel="Порог оценки класса bad", ylabel="Значение метрики", ylim=(0, 1.06))
     ax.legend(ncols=2, fontsize=9)
@@ -274,6 +284,7 @@ def test_figures(
     transfer: dict[str, Evaluation],
     winner: str,
     y: NDArray[np.int_],
+    later: dict[str, Evaluation],
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(7.2, 4.1), layout="constrained")
     for name, result in standard.items():
@@ -344,4 +355,20 @@ def test_figures(
         "Обычная проверка и перенос на другой станок",
         f"На M03 наибольшая AP у модели «{best}» ({transfer[best].metrics['AP']:.3f}). "
         f"Для выбранной модели AP изменилась на {delta:+.3f}.",
+    )
+
+    fig, ax = plt.subplots(figsize=(6.7, 3.2), layout="constrained")
+    late = [later[name].metrics["AP"] for name in names]
+    ax.bar(positions - 0.18, normal, 0.36, color=BLUE, label="Обычный тест")
+    ax.bar(positions + 0.18, late, 0.36, color=RED, label="Август 2021")
+    ax.set(xticks=positions, xticklabels=names, ylabel="AP", ylim=(0, 1.09))
+    ax.legend(fontsize=9)
+    best_late = max(names, key=lambda name: later[name].metrics["AP"])
+    out.add(
+        "time_transfer",
+        fig,
+        "Обычная проверка и перенос на более поздний период",
+        f"В августе 2021 наибольшая AP у модели «{best_late}» "
+        f"({later[best_late].metrics['AP']:.3f}). Для каждой модели настройки "
+        "временной проверки выбраны заново на более ранних файлах.",
     )

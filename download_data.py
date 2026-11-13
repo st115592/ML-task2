@@ -1,16 +1,17 @@
 """Загрузка зафиксированной версии Bosch CNC Machining."""
 
 import hashlib
-import json
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
+from tempfile import NamedTemporaryFile
 from urllib.request import Request, urlopen
 
 from cnc_data import EXPECTED_FILES
 
 REVISION = "d60581d6a3ab6015dcc5488c3d76112bb8e1bcb1"
 REPO = "boschresearch/CNC_Machining"
+MANIFEST = Path(__file__).with_name("bosch_manifest.tsv")
 
 
 def fetch(url: str) -> bytes:
@@ -33,36 +34,54 @@ def blob_sha(data: bytes) -> str:
     return digest.hexdigest()
 
 
-def fetch_record(root: Path, relative: PurePosixPath, size: int, sha: str) -> None:
+def fetch_record(
+    root: Path,
+    relative: PurePosixPath,
+    size: int,
+    sha: str,
+    *,
+    repair: bool = True,
+) -> None:
     path = root.joinpath(*relative.parts[1:])
     if path.is_file() and path.stat().st_size == size and blob_sha(path.read_bytes()) == sha:
         return
+    if not repair:
+        raise ValueError(f"Файл отсутствует или не прошёл проверку Bosch: {path}")
     url = f"https://raw.githubusercontent.com/{REPO}/{REVISION}/{relative}"
     contents = fetch(url)
     if len(contents) != size or blob_sha(contents) != sha:
         raise ValueError(f"Контрольная сумма не совпала для {relative}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_suffix(".part")
-    partial.write_bytes(contents)
-    partial.replace(path)
+    with NamedTemporaryFile(dir=path.parent, suffix=".part", delete=False) as stream:
+        partial = Path(stream.name)
+        try:
+            stream.write(contents)
+            stream.close()
+            partial.replace(path)
+        finally:
+            stream.close()
+            partial.unlink(missing_ok=True)
 
 
-def download_dataset(root: Path) -> None:
-    url = f"https://api.github.com/repos/{REPO}/git/trees/{REVISION}?recursive=1"
-    tree = json.loads(fetch(url))
+def download_dataset(root: Path, *, repair: bool = True) -> None:
     files = []
-    for row in tree["tree"]:
-        relative = PurePosixPath(row["path"])
-        if relative.parts[0] == "data" and relative.suffix == ".h5":
-            if len(relative.parts) != 5 or ".." in relative.parts or row["type"] != "blob":
-                raise ValueError(f"Неожиданный путь в источнике Bosch: {relative}")
-            files.append((relative, row["size"], row["sha"]))
-    if tree["truncated"] or len(files) != EXPECTED_FILES:
-        raise ValueError("GitHub вернул неполный список файлов Bosch")
-    print(f"Загрузка набора Bosch ({EXPECTED_FILES} файлов)", flush=True)
+    for line in MANIFEST.read_text(encoding="utf-8").splitlines():
+        name, size, sha = line.split("\t")
+        relative = PurePosixPath(name)
+        if (
+            len(relative.parts) != 5
+            or relative.parts[0] != "data"
+            or ".." in relative.parts
+            or relative.suffix != ".h5"
+        ):
+            raise ValueError(f"Неожиданный путь в манифесте Bosch: {relative}")
+        files.append((relative, int(size), sha))
+    if len(files) != EXPECTED_FILES or len({row[0] for row in files}) != EXPECTED_FILES:
+        raise ValueError("Неполный манифест файлов Bosch")
+    print(f"Проверка набора Bosch ({EXPECTED_FILES} файлов)", flush=True)
 
     def fetch_one(row: tuple[PurePosixPath, int, str]) -> None:
-        fetch_record(root, *row)
+        fetch_record(root, *row, repair=repair)
 
     with ThreadPoolExecutor(max_workers=16) as workers:
         for index, _ in enumerate(workers.map(fetch_one, files), 1):

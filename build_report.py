@@ -9,7 +9,7 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from threadpoolctl import threadpool_limits
 
-from cnc_data import EXPECTED_FILES, inventory
+from cnc_data import inventory
 from download_data import download_dataset
 from experiment import (
     BOOST,
@@ -25,6 +25,7 @@ from experiment import (
     scale_check,
     select,
     split,
+    time_split,
     tree_error,
 )
 
@@ -37,16 +38,16 @@ def main() -> None:
     parser.add_argument("--data", type=Path, help="Путь к уже загруженным данным Bosch")
     args = parser.parse_args()
     data = ROOT / ".bosch" / "data" if args.data is None else args.data.resolve()
-    if args.data is None and sum(1 for _ in data.glob("M*/OP*/*/*.h5")) != EXPECTED_FILES:
-        download_dataset(data)
+    download_dataset(data, repair=args.data is None)
     records = inventory(data)
     paths = np.array([str(record.path) for record in records])
     y = np.array([record.label for record in records])
     train, test, transfer = indices = split(records)
-    for part in indices:
+    earlier, late = time_indices = time_split(records)
+    for part in (*indices, *time_indices):
         if len(np.unique(y[part])) != 2:
             raise ValueError("В каждом разбиении должны присутствовать оба класса")
-    if min(np.bincount(y[train])) < FOLDS:
+    if any(min(np.bincount(y[part])) < FOLDS for part in (train, earlier)):
         raise ValueError("Слишком мало файлов редкого класса для пяти разбиений")
 
     BUILD.mkdir(exist_ok=True)
@@ -73,7 +74,9 @@ def main() -> None:
             boosting_error(x_train, y_train, cv, choices[BOOST]),
             feature_importance(x_train, y_train, cv, choices[winner]),
         )
-        print("Итоговая оценка на двух отложенных выборках", flush=True)
+        print("Подбор для переноса во времени", flush=True)
+        time_choices = select(paths[earlier], y[earlier], cv, candidates())
+        print("Итоговая оценка на отложенных выборках", flush=True)
         ordinary = {
             name: evaluate(choice, paths[test], y[test]) for name, choice in choices.items()
         }
@@ -82,14 +85,22 @@ def main() -> None:
             for name, choice in choices.items()
         }
 
-    test_figures(figures, ordinary, moved, winner, y[test])
+        later = {
+            name: evaluate(choice, paths[late], y[late]) for name, choice in time_choices.items()
+        }
+
+    test_figures(figures, ordinary, moved, winner, y[test], later)
     with (BUILD / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
         metrics = list(ordinary[winner].metrics)
         writer.writerow(["sample", "model", "cv_ap", "cv_ap_std", "threshold", *metrics])
-        for sample, values in (("ordinary", ordinary), ("transfer", moved)):
+        for sample, values, settings in (
+            ("ordinary", ordinary, choices),
+            ("transfer", moved, choices),
+            ("time", later, time_choices),
+        ):
             for name, value in values.items():
-                choice = choices[name]
+                choice = settings[name]
                 writer.writerow(
                     [
                         sample,
@@ -101,7 +112,20 @@ def main() -> None:
                     ]
                 )
     target = ROOT / "report.pdf"
-    build_report(target, figures, records, indices, choices, winner, ordinary, moved, scaling)
+    build_report(
+        target,
+        figures,
+        records,
+        indices,
+        choices,
+        winner,
+        ordinary,
+        moved,
+        scaling,
+        time_indices,
+        time_choices,
+        later,
+    )
     print(target, flush=True)
 
 

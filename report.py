@@ -178,8 +178,8 @@ def test_tables(report: Report, title: str, values: dict[str, Evaluation]) -> No
             "Модель",
             "Доля верных",
             "Сбал. доля",
-            "Точность",
-            "Полнота",
+            "Точность (precision)",
+            "Полнота (recall)",
             "F1",
             "ROC-AUC",
             "PR-AUC",
@@ -190,7 +190,7 @@ def test_tables(report: Report, title: str, values: dict[str, Evaluation]) -> No
     for name, value in values.items():
         rows.append([name, *[f"{metric:.3f}" for metric in value.metrics.values()]])
         matrices.append([name, *value.matrix.ravel()])
-    report.table(f"{title}. Метрики", rows, [27, 17, 17, 17, 16, 14, 22, 22, 16])
+    report.table(f"{title}. Метрики", rows, [25, 16, 16, 20, 17, 13, 22, 22, 16])
     report.table(f"{title}. Матрицы ошибок, число файлов", matrices, [38, 32, 32, 32, 32])
 
 
@@ -227,6 +227,9 @@ def build_report(
     standard: dict[str, Evaluation],
     transfer: dict[str, Evaluation],
     scaling: dict[str, tuple[np.ndarray, np.ndarray]],
+    time_indices: tuple[np.ndarray, np.ndarray],
+    time_choices: dict[str, Selection],
+    later: dict[str, Evaluation],
 ) -> None:
     configure_fonts()
     report = Report(figures)
@@ -241,13 +244,18 @@ def build_report(
     train, test, moved = splits
     result = standard[winner].metrics
     target = transfer[winner].metrics
+    earlier, late = time_indices
+    time_winner = max(time_choices, key=lambda name: time_choices[name].scores.mean())
     report.p(
         f"Исследованы {len(records)} записей трёхкомпонентного ускорения из набора Bosch. "
         "Цель работы — распознать аномальный процесс фрезерования по вибрации и проверить "
-        "сохранение качества на другом станке. Из каждой записи извлечены 24 признака. "
+        "сохранение качества на другом станке и в более позднем периоде. "
+        "Из каждой записи извлечены 24 признака. "
         "Сопоставлены семь классификаторов. Выбор по средней точности класса bad на "
         f"перекрёстной проверке дал модель «{winner}». На обычном тесте AP={result['AP']:.3f} "
-        f"и F1={result['F1']:.3f}. При переносе AP={target['AP']:.3f} и F1={target['F1']:.3f}."
+        f"и F1={result['F1']:.3f}. На M03 AP={target['AP']:.3f} и F1={target['F1']:.3f}. "
+        f"Для проверки на августе 2021 года модель «{time_winner}» выбрана "
+        f"по более ранним записям и получила AP={later[time_winner].metrics['AP']:.3f}."
     )
     report.p(
         "КЛЮЧЕВЫЕ СЛОВА: ФРЕЗЕРОВАНИЕ, ВИБРАЦИЯ, УСКОРЕНИЕ, КЛАССИФИКАЦИЯ, "
@@ -279,7 +287,7 @@ def build_report(
     report.p(
         "В работе проверяются два вопроса. Во-первых, какие методы лучше распознают "
         "редкие аномалии в новых записях со знакомых станков. Во-вторых, сохраняется ли "
-        "это качество на станке, чьих записей модель при обучении не видела. "
+        "это качество на новом станке и в более позднем периоде. "
         "Для этого сравниваются семь методов и измеряются как способность ставить "
         "аномалии выше в списке подозрительных записей, так и ошибки при выбранном пороге."
     )
@@ -303,7 +311,7 @@ def build_report(
         rows.append(
             [label, machines, len(indices), len(indices) - bad, bad, f"{bad / len(indices):.1%}"]
         )
-    report.table("Разбиение исходных файлов", rows, [40, 30, 23, 23, 23, 29])
+    report.table("Разбиение для обычного теста и переноса на M03", rows, [40, 30, 23, 23, 23, 29])
     report.p(
         "Обычный тест отвечает на вопрос, как модель работает на новых записях "
         "с уже знакомых станков. Для него отложены 25 % файлов M01 и M02 "
@@ -311,7 +319,19 @@ def build_report(
         "можно ли применить ту же модель на M03. Все его записи отложены целиком "
         "по схеме проверки по станкам, предложенной авторами набора [1]. В обоих "
         "тестах использованы одни и те же модели и пороги. Результат на M03 отражает "
-        "смену и станка, и состава операций."
+        "смену и станка, и состава операций. Дополнительно проверен перенос во времени "
+        "на тех же двух станках M01 и M02. Для него модели, параметры и пороги "
+        "заново подбирались только по записям до августа 2021 года."
+    )
+    known_operations = {records[i].operation for i in train}
+    known_periods = {records[i].period for i in train}
+    moved_operations = {records[i].operation for i in moved}
+    moved_periods = {records[i].period for i in moved}
+    report.p(
+        f"Из {len(moved_operations)} операций M03 в обучении встречаются "
+        f"{len(moved_operations & known_operations)}, из {len(moved_periods)} периодов — "
+        f"{len(moved_periods & known_periods)}. Поэтому перенос на M03 и проверка "
+        "на целиком отложенном августе отвечают на разные вопросы."
     )
     report.p(
         "Одна запись может содержать десятки тысяч отсчётов. Для сравнения файлов "
@@ -344,7 +364,9 @@ def build_report(
         "нормальными. Логистическая регрессия складывает взвешенные признаки, "
         "метод ближайших соседей (kNN) опирается на похожие примеры, а метод "
         "опорных векторов (SVM) строит нелинейную границу между классами. Для SVM "
-        "использованы радиальное ядро и сигмоидальная калибровка оценок."
+        "использованы радиальное ядро и сигмоидальная калибровка оценок. "
+        "На каждом из трёх внутренних разбиений калибровки медианы и масштабы "
+        "оцениваются только по файлам, на которых обучается SVM."
     )
     report.p(
         "Решающее дерево задаёт последовательность вопросов о признаках. Случайный "
@@ -383,16 +405,17 @@ def build_report(
     report.figure("cv")
     report.figure("grid")
     report.p(
-        "Порог превращает оценку аномальности в решение. При снижении порога "
-        "модель обычно находит больше аномалий, но также чаще поднимает ложную тревогу. "
-        "Полнота показывает долю обнаруженных аномалий, а точность — долю реальных "
-        "аномалий среди всех тревог. Метрика F1 объединяет эти две величины."
+        "При снижении порога модель обычно обнаруживает больше аномалий и чаще "
+        "подаёт ложные тревоги. Полнота (recall) показывает, какую долю аномалий "
+        "обнаружили, а точность (precision) — какая доля тревог была обоснованной. "
+        "Для выбора порога использован максимум F1. Эта метрика учитывает обе "
+        "величины и падает, если одна из них мала."
     )
     report.p(
-        "Для каждой обучаемой модели выбран порог с наибольшим F1 на оценках файлов, "
-        "которые были проверочными в соответствующем разбиении. Эти же разбиения "
-        "использовались при подборе параметров. Окончательная проверка проводится "
-        "на двух отложенных выборках."
+        f"Для модели «{winner}» этот максимум получен при пороге "
+        f"{choices[winner].threshold:.3f} на оценках проверочных частей обучения. "
+        "При равном F1 выбран больший порог, при котором тревог будет столько же "
+        "или меньше. Для M03 применён тот же порог."
     )
     report.figure("threshold")
 
@@ -432,7 +455,7 @@ def build_report(
 
     report.section("4 Итоговая проверка и перенос")
     report.p(
-        "После выбора моделей и порогов проведены две итоговые проверки. В таблицах "
+        "После выбора моделей и порогов проведены итоговые проверки. В таблицах "
         "доля верных ответов учитывает все файлы, а сбалансированная доля даёт "
         "одинаковый вес нормальному и аномальному классам. Матрицы ошибок показывают, "
         "сколько записей каждого класса распознано верно, сколько аномалий пропущено "
@@ -451,25 +474,26 @@ def build_report(
     report.figure("roc_pr")
     report.figure("matrix")
     report.figure("transfer")
-    deltas = [
-        ["Модель", "AP проверка", "AP тест", "AP M03", "Изм. AP", "F1 тест", "F1 M03", "Изм. F1"]
+    summary = [
+        ["Модель", "Выбранные параметры", "AP CV", "AP тест", "F1 тест", "AP M03", "F1 M03"]
     ]
-    for name in choices:
+    for name, choice in choices.items():
         src, dst = standard[name].metrics, transfer[name].metrics
-        deltas.append(
+        summary.append(
             [
                 name,
-                f"{choices[name].scores.mean():.3f}",
+                parameters(choice.params),
+                f"{choice.scores.mean():.3f}",
                 f"{src['AP']:.3f}",
-                f"{dst['AP']:.3f}",
-                f"{dst['AP'] - src['AP']:+.3f}",
                 f"{src['F1']:.3f}",
+                f"{dst['AP']:.3f}",
                 f"{dst['F1']:.3f}",
-                f"{dst['F1'] - src['F1']:+.3f}",
             ]
         )
     report.table(
-        "Сводка перекрёстной проверки, теста и переноса", deltas, [32, 24, 20, 19, 19, 19, 18, 19]
+        "Параметры и результаты обычной проверки и переноса на M03",
+        summary,
+        [23, 57, 18, 18, 18, 18, 18],
     )
     report.p(
         f"Доли аномалий составляют {sum(records[i].label for i in test) / len(test):.1%} "
@@ -478,7 +502,40 @@ def build_report(
         "сопоставлении AP и F1 также следует учитывать малое число аномальных файлов."
     )
 
-    report.section("5 Интерпретация и инженерный разбор")
+    report.section("5 Перенос на август 2021 года")
+    late_bad = sum(records[i].label for i in late)
+    report.p(
+        f"Для временной проверки на M01 и M02 использованы {len(earlier)} более ранних "
+        f"записей для обучения и {len(late)} записей августа 2021 года для теста, "
+        f"из них {late_bad} аномальных. По пяти разбиениям ранних файлов отдельно "
+        "подобраны параметры и пороги. Выбор по средней AP на ранних файлах дал "
+        f"модель «{time_winner}». Разница между обычным тестом и августом 2021 года "
+        "отражает и смену периода, и изменение состава обучающей и тестовой выборок."
+    )
+    report.figure("time_transfer")
+    time_rows = [["Модель", "Параметры", "Порог", "AP CV", "AP август", "F1 август", "Изм. AP"]]
+    for name, choice in time_choices.items():
+        metrics = later[name].metrics
+        delta = metrics["AP"] - standard[name].metrics["AP"]
+        time_rows.append(
+            [
+                name,
+                parameters(choice.params),
+                f"{choice.threshold:.3f}",
+                f"{choice.scores.mean():.3f}",
+                f"{metrics['AP']:.3f}",
+                f"{metrics['F1']:.3f}",
+                f"{delta:+.3f}",
+            ]
+        )
+    report.table(
+        "Подбор на ранних записях и проверка на августе 2021 года",
+        time_rows,
+        [23, 57, 17, 17, 19, 19, 18],
+    )
+    test_tables(report, "Август 2021 года", later)
+
+    report.section("6 Интерпретация и инженерный разбор")
     report.p(
         "Чтобы понять, на какие измерения опирается выбранная модель, один признак "
         "перемешивали между файлами, сохраняя остальные. Если AP падает, модель "
@@ -496,14 +553,6 @@ def build_report(
             f"{title}. Модель «{winner}» пропустила {fn} из {fn + tp} аномалий, а "
             f"{fp} из {tn + fp} нормальных записей вызвали ложную тревогу."
         )
-        labels = np.array([records[i].label for i in indices])
-        good = np.median(evaluation.scores[labels == 0])
-        bad = np.median(evaluation.scores[labels == 1])
-        report.p(
-            f"Медиана оценки bad среди нормальных файлов равна {good:.3f}, "
-            f"среди аномальных — {bad:.3f}. Рабочий порог равен "
-            f"{choices[winner].threshold:.3f}."
-        )
         rows = errors_by_operation(records, indices, evaluation)
         if rows:
             report.table(
@@ -511,12 +560,17 @@ def build_report(
                 [["Станок / операция", "good", "Ложные тревоги", "bad", "Пропуски"], *rows],
                 [48, 24, 36, 24, 36],
             )
-            key, _, false_pos, _, false_neg = rows[0]
+        if title == "Перенос на M03" and fp:
+            examples = sorted((row for row in rows if row[2]), key=lambda row: -row[2])[:2]
+            details = ", ".join(
+                f"{key.split(' / ')[-1]} — {fp} из {good}" for key, good, fp, _, _ in examples
+            )
+            labels = np.array([records[i].label for i in indices])
+            median = np.median(evaluation.scores[labels == 0])
             report.p(
-                f"Для {key} число пропусков равно {false_neg}, "
-                f"число ложных тревог равно {false_pos}. "
-                "В таблице приведены операции с ошибками, а столбцы good и bad "
-                "показывают, сколько записей каждого класса было проверено."
+                f"Ложные тревоги возникали в нескольких операциях ({details} нормальных "
+                f"записей). Медианная оценка нормальных файлов M03 составила {median:.3f} "
+                f"при рабочем пороге {choices[winner].threshold:.3f}."
             )
     ordinary_tn, ordinary_fp, _, _ = standard[winner].matrix.ravel()
     moved_tn, moved_fp, _, _ = transfer[winner].matrix.ravel()
@@ -531,25 +585,28 @@ def build_report(
     )
 
     report.section("ЗАКЛЮЧЕНИЕ")
-    report.p(
-        f"По средней AP на обучающих разбиениях выбрана модель «{winner}» с рабочим "
-        f"порогом {choices[winner].threshold:.4g}. На файлах знакомых станков получены "
-        f"AP={result['AP']:.3f} и F1={result['F1']:.3f}. На M03 AP={target['AP']:.3f}, "
-        f"F1={target['F1']:.3f}. Изменение составляет {target['AP'] - result['AP']:+.3f} "
-        f"по AP и {target['F1'] - result['F1']:+.3f} по F1."
-    )
     winner_moved = max(transfer, key=lambda name: transfer[name].metrics["AP"])
     best_f1 = max(transfer, key=lambda name: transfer[name].metrics["F1"])
+    tn, fp, fn, tp = transfer[winner].matrix.ravel()
     report.p(
-        f"При фиксированных порогах на M03 наибольший F1 у модели «{best_f1}» "
-        f"({transfer[best_f1].metrics['F1']:.3f})."
+        f"Модель «{winner}» выбрана по средней AP на обучающих разбиениях. "
+        f"При переносе на M03 с прежним порогом она обнаружила {tp} из {tp + fn} аномалий "
+        f"и подала ложную тревогу для {fp} из {tn + fp} нормальных записей. "
+        f"На этом станке модель «{winner_moved}» лучше ранжировала аномалии "
+        f"(AP {transfer[winner_moved].metrics['AP']:.3f}), а модель «{best_f1}» "
+        f"получила лучший F1 при заранее выбранном пороге "
+        f"({transfer[best_f1].metrics['F1']:.3f}). Сравнение относится к одному "
+        "отложенному станку."
     )
+    best_time = max(later, key=lambda name: later[name].metrics["AP"])
+    time_metrics = later[time_winner].metrics
     report.p(
-        f"Лучшая AP при переносе у модели «{winner_moved}» "
-        f"({transfer[winner_moved].metrics['AP']:.3f}). "
-        "Ранжирование записей и решение о тревоге измеряют разные свойства модели. "
-        "Проверка на знакомых станках дала высокие оценки выбранной модели, "
-        "но при том же пороге на M03 она выдавала слишком много ложных тревог."
+        f"При переносе на август 2021 года модель «{time_winner}», выбранная по ранним "
+        f"записям, получила AP {time_metrics['AP']:.3f} и F1 {time_metrics['F1']:.3f}. "
+        f"Наибольшая AP на этом периоде у модели «{best_time}» "
+        f"({later[best_time].metrics['AP']:.3f}). В августовской выборке всего "
+        f"{late_bad} аномальных записей, поэтому результаты чувствительны "
+        "к ошибкам на отдельных файлах."
     )
 
     report.section("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ")
