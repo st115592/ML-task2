@@ -9,17 +9,17 @@
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
-# Распакуйте архив по ссылке ниже в папку проекта.
-# Поместите каталог data из архива в .bosch/data.
 ```
 
-В работе использована ревизия Bosch `d60581d6a3ab6015dcc5488c3d76112bb8e1bcb1`. Архив этой ревизии доступен [на GitHub](https://github.com/boschresearch/CNC_Machining/archive/d60581d6a3ab6015dcc5488c3d76112bb8e1bcb1.zip). Если каталог `data` уже находится в другой подпапке проекта, укажите его через `--data`.
+В работе использована ревизия Bosch `d60581d6a3ab6015dcc5488c3d76112bb8e1bcb1`. Архив этой ревизии доступен [на GitHub](https://github.com/boschresearch/CNC_Machining/archive/d60581d6a3ab6015dcc5488c3d76112bb8e1bcb1.zip). Архив можно использовать для сборки без доступа к сети. Укажите путь к распакованному каталогу `data` через `--data`.
 
 ## Сборка одной командой
 
 ```powershell
 .\.venv\Scripts\python build_report.py
 ```
+
+При первом запуске команда скачивает 1702 файла Bosch (около 950 МБ) в `.bosch/data` и сверяет их контрольные суммы. При повторном запуске используются локальные файлы.
 
 Команда читает исходные записи, строит признаки внутри конвейера, подбирает параметры и пороги, выполняет две отложенные проверки и создаёт `report.pdf`, рисунки и `build/metrics.csv`. Производные файлы можно удалить и собрать снова. Исходный набор хранится локально.
 
@@ -32,7 +32,7 @@ python -m venv .venv
 ```powershell
 .\.venv\Scripts\python -m pip install -r requirements-dev.txt
 .\.venv\Scripts\python -m pytest
-.\.venv\Scripts\python -m black --check --line-length 99 cnc_data.py experiment.py figures.py report.py build_report.py test_calculations.py
+.\.venv\Scripts\python -m black --check --line-length 99 cnc_data.py download_data.py experiment.py figures.py report.py build_report.py test_calculations.py
 .\.venv\Scripts\python -m flake8 .
 ```
 

@@ -9,7 +9,8 @@ import numpy as np
 from sklearn.model_selection import StratifiedKFold
 from threadpoolctl import threadpool_limits
 
-from cnc_data import inventory
+from cnc_data import EXPECTED_FILES, inventory
+from download_data import download_dataset
 from experiment import (
     BOOST,
     FOREST,
@@ -33,9 +34,12 @@ BUILD = ROOT / "build"
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--data", type=Path, default=ROOT / ".bosch" / "data")
+    parser.add_argument("--data", type=Path, help="Путь к уже загруженным данным Bosch")
     args = parser.parse_args()
-    records = inventory(args.data.resolve())
+    data = ROOT / ".bosch" / "data" if args.data is None else args.data.resolve()
+    if args.data is None and sum(1 for _ in data.glob("M*/OP*/*/*.h5")) != EXPECTED_FILES:
+        download_dataset(data)
+    records = inventory(data)
     paths = np.array([str(record.path) for record in records])
     y = np.array([record.label for record in records])
     train, test, transfer = indices = split(records)
