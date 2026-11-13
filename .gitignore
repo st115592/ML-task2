@@ -1,0 +1,8 @@
+.bosch/
+.deps/
+.venv/
+build/
+__pycache__/
+.pytest_cache/
+bosch.zip
+CNC_Machining-*/
