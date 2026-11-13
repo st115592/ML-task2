@@ -154,12 +154,18 @@ def period_order(period: str) -> tuple[int, int]:
     return int(year), MONTHS[month]
 
 
-def time_split(records: list[Recording]) -> tuple[Labels, Labels]:
+def time_split(records: list[Recording]) -> tuple[Labels, Labels, Labels]:
     source = [i for i, row in enumerate(records) if row.machine in {"M01", "M02"}]
     cutoff = period_order(LATE_PERIOD)
     earlier = [i for i in source if period_order(records[i].period) < cutoff]
     late = [i for i in source if records[i].period == LATE_PERIOD]
-    return np.array(earlier, dtype=int), np.array(late, dtype=int)
+    train, control = train_test_split(
+        np.array(earlier, dtype=int),
+        test_size=0.25,
+        random_state=SEED,
+        stratify=[records[i].label for i in earlier],
+    )
+    return train, control, np.array(late, dtype=int)
 
 
 def threshold_metrics(
@@ -231,6 +237,19 @@ def evaluate(selection: Selection, x: Paths, y: Labels) -> Evaluation:
         "AP": average_precision_score(y, score),
     }
     return Evaluation(score, pred, metrics, confusion_matrix(y, pred, labels=[0, 1]))
+
+
+def evaluate_time_transfer(
+    x: Paths,
+    y: Labels,
+    indices: tuple[Labels, Labels, Labels],
+    cv: StratifiedKFold,
+) -> tuple[dict[str, Selection], dict[str, Evaluation], dict[str, Evaluation]]:
+    train, control, late = indices
+    choices = select(x[train], y[train], cv, candidates())
+    baseline = {name: evaluate(choice, x[control], y[control]) for name, choice in choices.items()}
+    august = {name: evaluate(choice, x[late], y[late]) for name, choice in choices.items()}
+    return choices, baseline, august
 
 
 def scale_check(

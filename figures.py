@@ -284,6 +284,7 @@ def test_figures(
     transfer: dict[str, Evaluation],
     winner: str,
     y: NDArray[np.int_],
+    early_test: dict[str, Evaluation],
     later: dict[str, Evaluation],
 ) -> None:
     fig, axes = plt.subplots(1, 2, figsize=(7.2, 4.1), layout="constrained")
@@ -358,8 +359,9 @@ def test_figures(
     )
 
     fig, ax = plt.subplots(figsize=(6.7, 3.2), layout="constrained")
+    early = [early_test[name].metrics["AP"] for name in names]
     late = [later[name].metrics["AP"] for name in names]
-    ax.bar(positions - 0.18, normal, 0.36, color=BLUE, label="Обычный тест")
+    ax.bar(positions - 0.18, early, 0.36, color=BLUE, label="Ранний тест")
     ax.bar(positions + 0.18, late, 0.36, color=RED, label="Август 2021")
     ax.set(xticks=positions, xticklabels=names, ylabel="AP", ylim=(0, 1.09))
     ax.legend(fontsize=9)
@@ -367,8 +369,8 @@ def test_figures(
     out.add(
         "time_transfer",
         fig,
-        "Обычная проверка и перенос на более поздний период",
+        "Ранний тест и август 2021 года",
         f"В августе 2021 наибольшая AP у модели «{best_late}» "
-        f"({later[best_late].metrics['AP']:.3f}). Для каждой модели настройки "
-        "временной проверки выбраны заново на более ранних файлах.",
+        f"({later[best_late].metrics['AP']:.3f}). Для каждой пары столбцов "
+        "использована одна обученная модель.",
     )

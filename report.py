@@ -229,6 +229,7 @@ def build_report(
     scaling: dict[str, tuple[np.ndarray, np.ndarray]],
     time_indices: tuple[np.ndarray, np.ndarray],
     time_choices: dict[str, Selection],
+    early_test: dict[str, Evaluation],
     later: dict[str, Evaluation],
 ) -> None:
     configure_fonts()
@@ -244,7 +245,7 @@ def build_report(
     train, test, moved = splits
     result = standard[winner].metrics
     target = transfer[winner].metrics
-    earlier, late = time_indices
+    earlier, control, late = time_indices
     time_winner = max(time_choices, key=lambda name: time_choices[name].scores.mean())
     report.p(
         f"Исследованы {len(records)} записей трёхкомпонентного ускорения из набора Bosch. "
@@ -254,8 +255,9 @@ def build_report(
         "Сопоставлены семь классификаторов. Выбор по средней точности класса bad на "
         f"перекрёстной проверке дал модель «{winner}». На обычном тесте AP={result['AP']:.3f} "
         f"и F1={result['F1']:.3f}. На M03 AP={target['AP']:.3f} и F1={target['F1']:.3f}. "
-        f"Для проверки на августе 2021 года модель «{time_winner}» выбрана "
-        f"по более ранним записям и получила AP={later[time_winner].metrics['AP']:.3f}."
+        f"Для проверки переноса во времени модель «{time_winner}» обучили на более "
+        "ранних записях. На данных августа 2021 года модель получила "
+        f"AP {later[time_winner].metrics['AP']:.3f}."
     )
     report.p(
         "КЛЮЧЕВЫЕ СЛОВА: ФРЕЗЕРОВАНИЕ, ВИБРАЦИЯ, УСКОРЕНИЕ, КЛАССИФИКАЦИЯ, "
@@ -475,7 +477,15 @@ def build_report(
     report.figure("matrix")
     report.figure("transfer")
     summary = [
-        ["Модель", "Выбранные параметры", "AP CV", "AP тест", "F1 тест", "AP M03", "F1 M03"]
+        [
+            "Модель",
+            "Выбранные параметры",
+            "Средняя AP по 5 разбиениям",
+            "AP тест",
+            "F1 тест",
+            "AP M03",
+            "F1 M03",
+        ]
     ]
     for name, choice in choices.items():
         src, dst = standard[name].metrics, transfer[name].metrics
@@ -493,7 +503,7 @@ def build_report(
     report.table(
         "Параметры и результаты обычной проверки и переноса на M03",
         summary,
-        [23, 57, 18, 18, 18, 18, 18],
+        [23, 52, 23, 18, 18, 18, 18],
     )
     report.p(
         f"Доли аномалий составляют {sum(records[i].label for i in test) / len(test):.1%} "
@@ -505,34 +515,60 @@ def build_report(
     report.section("5 Перенос на август 2021 года")
     late_bad = sum(records[i].label for i in late)
     report.p(
-        f"Для временной проверки на M01 и M02 использованы {len(earlier)} более ранних "
-        f"записей для обучения и {len(late)} записей августа 2021 года для теста, "
-        f"из них {late_bad} аномальных. По пяти разбиениям ранних файлов отдельно "
-        "подобраны параметры и пороги. Выбор по средней AP на ранних файлах дал "
-        f"модель «{time_winner}». Разница между обычным тестом и августом 2021 года "
-        "отражает и смену периода, и изменение состава обучающей и тестовой выборок."
+        f"Из записей M01 и M02 до августа 2021 года выделили ранний тест "
+        f"({len(control)} файлов, из них {sum(records[i].label for i in control)} "
+        f"аномальных). Остальные {len(earlier)} ранних файлов использовали для обучения "
+        "и подбора параметров и порогов. В августовский тест вошли все "
+        f"{len(late)} записей этих двух станков, из них {late_bad} аномальных."
+    )
+    report.p(
+        f"По средней AP на обучении выбрали модель «{time_winner}». В обоих тестах "
+        "для каждого метода использовали один и тот же обученный классификатор и порог. "
+        "Последний столбец таблицы показывает AP августа за вычетом AP раннего теста."
     )
     report.figure("time_transfer")
-    time_rows = [["Модель", "Параметры", "Порог", "AP CV", "AP август", "F1 август", "Изм. AP"]]
+    time_rows = [
+        [
+            "Модель",
+            "Параметры",
+            "Порог",
+            "Средняя AP по 5 разбиениям",
+            "AP ранняя",
+            "F1 ранний",
+            "AP август",
+            "F1 август",
+            "AP август − ранняя",
+        ]
+    ]
     for name, choice in time_choices.items():
         metrics = later[name].metrics
-        delta = metrics["AP"] - standard[name].metrics["AP"]
+        early_metrics = early_test[name].metrics
+        delta = metrics["AP"] - early_metrics["AP"]
         time_rows.append(
             [
                 name,
                 parameters(choice.params),
                 f"{choice.threshold:.3f}",
                 f"{choice.scores.mean():.3f}",
+                f"{early_metrics['AP']:.3f}",
+                f"{early_metrics['F1']:.3f}",
                 f"{metrics['AP']:.3f}",
                 f"{metrics['F1']:.3f}",
                 f"{delta:+.3f}",
             ]
         )
     report.table(
-        "Подбор на ранних записях и проверка на августе 2021 года",
+        "Сравнение раннего и августовского тестов при одном обучении",
         time_rows,
-        [23, 57, 17, 17, 19, 19, 18],
+        [19, 38, 13, 23, 15, 14, 15, 14, 19],
     )
+    for name in dict.fromkeys((time_winner, "SVM", FOREST)):
+        _, false_alarms, missed, detected = later[name].matrix.ravel()
+        report.p(
+            f"В августе модель «{name}» обнаружила {detected} из {detected + missed} "
+            f"аномалий. Число ложных тревог — {false_alarms}."
+        )
+
     test_tables(report, "Август 2021 года", later)
 
     report.section("6 Интерпретация и инженерный разбор")
@@ -598,15 +634,21 @@ def build_report(
         f"({transfer[best_f1].metrics['F1']:.3f}). Сравнение относится к одному "
         "отложенному станку."
     )
-    best_time = max(later, key=lambda name: later[name].metrics["AP"])
-    time_metrics = later[time_winner].metrics
+    early_ap = early_test[time_winner].metrics["AP"]
+    late_ap = later[time_winner].metrics["AP"]
+    _, alarms, _, detected = later[time_winner].matrix.ravel()
+    svm_early = early_test["SVM"].metrics["AP"]
+    svm_late = later["SVM"].metrics["AP"]
+    forest_early = early_test[FOREST].metrics["AP"]
+    forest_late = later[FOREST].metrics["AP"]
     report.p(
-        f"При переносе на август 2021 года модель «{time_winner}», выбранная по ранним "
-        f"записям, получила AP {time_metrics['AP']:.3f} и F1 {time_metrics['F1']:.3f}. "
-        f"Наибольшая AP на этом периоде у модели «{best_time}» "
-        f"({later[best_time].metrics['AP']:.3f}). В августовской выборке всего "
-        f"{late_bad} аномальных записей, поэтому результаты чувствительны "
-        "к ошибкам на отдельных файлах."
+        f"При переносе во времени AP модели «{time_winner}», выбранной по ранним записям, "
+        f"изменилась с {early_ap:.3f} до {late_ap:.3f}. В августе она обнаружила "
+        f"{detected} из {late_bad} аномалий, число ложных тревог — {alarms}. "
+        f"У SVM AP изменилась с {svm_early:.3f} до {svm_late:.3f}. "
+        f"У случайного леса AP изменилась с {forest_early:.3f} до {forest_late:.3f}. "
+        f"Августовский тест включает только {late_bad} аномалий, поэтому одна ошибка "
+        "может заметно изменить результат."
     )
 
     report.section("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ")

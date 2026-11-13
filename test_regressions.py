@@ -12,6 +12,7 @@ from sklearn.metrics import f1_score
 from sklearn.preprocessing import StandardScaler
 
 import download_data
+import experiment
 from cnc_data import Recording
 from experiment import SVM, candidates, operating_threshold, split, threshold_metrics, time_split
 from figures import threshold_step
@@ -54,9 +55,15 @@ def test_file_and_period_splits() -> None:
     assert not (paths[0] & paths[1] or paths[0] & paths[2] or paths[1] & paths[2])
     assert {records[i].machine for i in [*train, *test]} == {"M01", "M02"}
     assert set(moved) == {i for i, row in enumerate(records) if row.machine == "M03"}
-    earlier, late = time_split(records)
-    assert not set(earlier) & set(late)
-    assert set(earlier) == {
+    earlier, control, late = time_split(records)
+    train_paths, control_paths, late_paths = (
+        {records[i].path for i in indices} for indices in (earlier, control, late)
+    )
+    assert not (
+        train_paths & control_paths or train_paths & late_paths or control_paths & late_paths
+    )
+    assert len(control) == 8
+    assert set(earlier) | set(control) == {
         i
         for i, row in enumerate(records)
         if row.machine != "M03" and row.period in {"Aug 2019", "Feb 2021"}
@@ -64,6 +71,44 @@ def test_file_and_period_splits() -> None:
     assert set(late) == {
         i for i, row in enumerate(records) if row.machine != "M03" and row.period == "Aug 2021"
     }
+
+
+def test_time_transfer_reuses_model_and_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    paths = np.array(
+        ["train-good", "train-bad", "early-good", "early-bad", "august-good", "august-bad"]
+    )
+    labels = np.array([0, 1, 0, 1, 0, 1])
+    indices = (np.array([0, 1]), np.array([2, 3]), np.array([4, 5]))
+    cv = experiment.StratifiedKFold(2)
+    train_calls: list[tuple[str, ...]] = []
+    predict_calls: list[tuple[str, ...]] = []
+
+    class FittedModel(experiment.BaseEstimator):
+        def predict_proba(self, x: NDArray[np.str_]) -> NDArray[np.float64]:
+            predict_calls.append(tuple(x))
+            return np.array([[0.4, 0.6], [0.2, 0.8]])
+
+    selection = experiment.Selection(
+        FittedModel(), {}, np.array([0.9]), {}, 0.7, np.array([0.6, 0.8])
+    )
+
+    def select(
+        x: NDArray[np.str_],
+        y: NDArray[np.int_],
+        cv: experiment.StratifiedKFold,
+        models: dict[str, experiment.Candidate],
+    ) -> dict[str, experiment.Selection]:
+        train_calls.append(tuple(x))
+        np.testing.assert_array_equal(y, [0, 1])
+        return {"model": selection}
+
+    monkeypatch.setattr(experiment, "select", select)
+    selected, early, august = experiment.evaluate_time_transfer(paths, labels, indices, cv)
+    assert selected["model"] is selection
+    assert train_calls == [("train-good", "train-bad")]
+    assert predict_calls == [("early-good", "early-bad"), ("august-good", "august-bad")]
+    for result in (early, august):
+        np.testing.assert_array_equal(result["model"].prediction, [0, 1])
 
 
 def test_svm_fits_preprocessing_inside_calibration(monkeypatch: pytest.MonkeyPatch) -> None:

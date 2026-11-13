@@ -20,6 +20,7 @@ from experiment import (
     boosting_error,
     candidates,
     evaluate,
+    evaluate_time_transfer,
     feature_importance,
     forest_error,
     scale_check,
@@ -43,7 +44,7 @@ def main() -> None:
     paths = np.array([str(record.path) for record in records])
     y = np.array([record.label for record in records])
     train, test, transfer = indices = split(records)
-    earlier, late = time_indices = time_split(records)
+    earlier, _, _ = time_indices = time_split(records)
     for part in (*indices, *time_indices):
         if len(np.unique(y[part])) != 2:
             raise ValueError("В каждом разбиении должны присутствовать оба класса")
@@ -75,7 +76,7 @@ def main() -> None:
             feature_importance(x_train, y_train, cv, choices[winner]),
         )
         print("Подбор для переноса во времени", flush=True)
-        time_choices = select(paths[earlier], y[earlier], cv, candidates())
+        time_choices, early_test, later = evaluate_time_transfer(paths, y, time_indices, cv)
         print("Итоговая оценка на отложенных выборках", flush=True)
         ordinary = {
             name: evaluate(choice, paths[test], y[test]) for name, choice in choices.items()
@@ -85,11 +86,7 @@ def main() -> None:
             for name, choice in choices.items()
         }
 
-        later = {
-            name: evaluate(choice, paths[late], y[late]) for name, choice in time_choices.items()
-        }
-
-    test_figures(figures, ordinary, moved, winner, y[test], later)
+    test_figures(figures, ordinary, moved, winner, y[test], early_test, later)
     with (BUILD / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
         metrics = list(ordinary[winner].metrics)
@@ -97,7 +94,8 @@ def main() -> None:
         for sample, values, settings in (
             ("ordinary", ordinary, choices),
             ("transfer", moved, choices),
-            ("time", later, time_choices),
+            ("time_early", early_test, time_choices),
+            ("time_august", later, time_choices),
         ):
             for name, value in values.items():
                 choice = settings[name]
@@ -124,6 +122,7 @@ def main() -> None:
         scaling,
         time_indices,
         time_choices,
+        early_test,
         later,
     )
     print(target, flush=True)
