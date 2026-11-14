@@ -299,7 +299,7 @@ def build_report(
 ) -> None:
     configure_fonts()
     report = Report(figures)
-    report.p("Санкт-Петербургский государственный университет (СПбГУ)", "center")
+    report.p("Санкт-Петербургский государственный университет", "center")
     report.story.append(Spacer(1, 64 * mm))
     report.p("Задание 2. Классификация", "center")
     report.story.append(Spacer(1, 8 * mm))
