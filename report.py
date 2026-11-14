@@ -8,7 +8,7 @@ from xml.sax.saxutils import escape
 
 import numpy as np
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
@@ -25,6 +25,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from reportlab.platypus.doctemplate import IndexingFlowable
 from reportlab.platypus.tableofcontents import TableOfContents
 
 from cnc_data import Recording
@@ -82,6 +83,22 @@ def styles() -> dict[str, ParagraphStyle]:
             firstLineIndent=0,
             spaceAfter=6,
         ),
+        "table_caption": ParagraphStyle(
+            "TableCaption",
+            fontName="Times",
+            fontSize=11,
+            leading=14,
+            alignment=TA_LEFT,
+            spaceAfter=6,
+            keepWithNext=True,
+        ),
+        "keywords": ParagraphStyle(
+            "Keywords",
+            parent=body,
+            alignment=TA_LEFT,
+            firstLineIndent=0,
+        ),
+        "reference": ParagraphStyle("Reference", parent=body, keepWithNext=True),
         "cell": ParagraphStyle(
             "Cell", parent=body, fontSize=9.5, leading=12, firstLineIndent=0, spaceAfter=0
         ),
@@ -95,7 +112,36 @@ class ReportDocument(SimpleDocTemplate):
             self.notify("TOCEntry", (0, flowable.getPlainText(), self.page))
 
 
+class ReportExtent(IndexingFlowable):
+    """Подставляет число страниц после стабилизации вёрстки."""
+
+    def __init__(self, style: ParagraphStyle) -> None:
+        super().__init__()
+        self.style = style
+        self.pages = 0
+        self.previous_pages = 0
+        self.counts = ""
+
+    def beforeBuild(self) -> None:
+        self.previous_pages, self.pages = self.pages, 0
+
+    def notify(self, kind: str, stuff: Any) -> None:
+        if kind == "ReportPage":
+            self.pages = stuff
+
+    def isSatisfied(self) -> bool:
+        return self.pages == self.previous_pages
+
+    def wrap(self, availWidth: float, availHeight: float) -> tuple[float, float]:
+        self.paragraph = Paragraph(f"Отчёт {self.previous_pages} с., {self.counts}.", self.style)
+        return self.paragraph.wrap(availWidth, availHeight)
+
+    def draw(self) -> None:
+        self.paragraph.drawOn(self.canv, 0, 0)
+
+
 def footer(canvas: Canvas, doc: ReportDocument) -> None:
+    doc.notify("ReportPage", doc.page)
     if doc.page > 1:
         canvas.saveState()
         canvas.setFont("Times", 12)
@@ -118,7 +164,7 @@ class Report:
         self.story.append(PageBreak())
         self.p(title, "section")
 
-    def figure(self, key: str, max_height: float = 125) -> None:
+    def figure(self, key: str, reference: str, max_height: float = 125) -> None:
         self.image_count += 1
         path, title, finding = self.figures.items[key]
         img = Image(str(path))
@@ -126,13 +172,22 @@ class Report:
         img.drawWidth, img.drawHeight = img.imageWidth * scale, img.imageHeight * scale
         caption = Paragraph(escape(f"Рисунок {self.image_count} — {title}"), self.style["caption"])
         self.story.append(
-            KeepTogether([img, caption, Paragraph(escape(finding), self.style["body"])])
+            KeepTogether(
+                [
+                    Paragraph(escape(reference.format(n=self.image_count)), self.style["body"]),
+                    img,
+                    caption,
+                    Paragraph(escape(finding), self.style["body"]),
+                ]
+            )
         )
 
-    def table(self, name: str, rows: list[list[Any]], widths: list[float]) -> None:
+    def table(self, name: str, rows: list[list[Any]], widths: list[float], reference: str) -> None:
         self.table_count += 1
-        caption = Paragraph(escape(f"Таблица {self.table_count} — {name}"), self.style["caption"])
-        caption.keepWithNext = True
+        self.p(reference.format(n=self.table_count), "reference")
+        caption = Paragraph(
+            escape(f"Таблица {self.table_count} — {name}"), self.style["table_caption"]
+        )
         self.story.append(caption)
         cells = [[Paragraph(escape(str(v)), self.style["cell"]) for v in row] for row in rows]
         table = Table(cells, colWidths=[w * mm for w in widths], repeatRows=1, hAlign="CENTER")
@@ -190,8 +245,18 @@ def test_tables(report: Report, title: str, values: dict[str, Evaluation]) -> No
     for name, value in values.items():
         rows.append([name, *[f"{metric:.3f}" for metric in value.metrics.values()]])
         matrices.append([name, *value.matrix.ravel()])
-    report.table(f"{title}. Метрики", rows, [25, 16, 16, 20, 17, 13, 22, 22, 16])
-    report.table(f"{title}. Матрицы ошибок, число файлов", matrices, [38, 32, 32, 32, 32])
+    report.table(
+        f"{title}. Метрики",
+        rows,
+        [25, 16, 16, 20, 17, 13, 22, 22, 16],
+        f"Метрики для выборки «{title}» приведены в таблице {{n}}.",
+    )
+    report.table(
+        f"{title}. Матрицы ошибок, число файлов",
+        matrices,
+        [38, 32, 32, 32, 32],
+        f"Число верных и ошибочных решений для выборки «{title}» приведено в таблице {{n}}.",
+    )
 
 
 def errors_by_operation(
@@ -234,14 +299,23 @@ def build_report(
 ) -> None:
     configure_fonts()
     report = Report(figures)
-    report.story.append(Spacer(1, 74 * mm))
+    report.p("Санкт-Петербургский государственный университет (СПбГУ)", "center")
+    report.story.append(Spacer(1, 64 * mm))
     report.p("Задание 2. Классификация", "center")
     report.story.append(Spacer(1, 8 * mm))
     report.p("Нормальный и аномальный режим фрезерного станка", "title")
     report.story.append(Spacer(1, 13 * mm))
     report.p("Клименко Георгий", "center")
+    report.story.append(Spacer(1, 104 * mm))
+    report.p("2026", "center")
 
     report.section("РЕФЕРАТ")
+    extent = ReportExtent(report.style["body"])
+    report.story.append(extent)
+    report.p(
+        "ФРЕЗЕРОВАНИЕ, ВИБРАЦИЯ, УСКОРЕНИЕ, КЛАССИФИКАЦИЯ, " "ДИСБАЛАНС КЛАССОВ, ПЕРЕНОС МОДЕЛИ",
+        "keywords",
+    )
     train, test, moved = splits
     result = standard[winner].metrics
     target = transfer[winner].metrics
@@ -259,14 +333,9 @@ def build_report(
         "ранних записях. На данных августа 2021 года модель получила "
         f"AP {later[time_winner].metrics['AP']:.3f}."
     )
-    report.p(
-        "КЛЮЧЕВЫЕ СЛОВА: ФРЕЗЕРОВАНИЕ, ВИБРАЦИЯ, УСКОРЕНИЕ, КЛАССИФИКАЦИЯ, "
-        "ДИСБАЛАНС КЛАССОВ, ПЕРЕНОС МОДЕЛИ."
-    )
-
     report.story.append(PageBreak())
     report.p("СОДЕРЖАНИЕ", "center")
-    toc = TableOfContents()
+    toc = TableOfContents(dotsMinLevel=0)
     toc.levelStyles = [report.style["toc"]]
     report.story.append(toc)
 
@@ -301,8 +370,14 @@ def build_report(
         "аномальный. За объект взят целый HDF5-файл. Единица исходных отсчётов в описании "
         "формата не указана, поэтому амплитуда приведена в единицах файла."
     )
-    report.figure("classes", max_height=55)
-    report.figure("signal", max_height=99)
+    report.figure(
+        "classes", "Распределение записей по классам показано на рисунке {n}.", max_height=55
+    )
+    report.figure(
+        "signal",
+        "Фрагменты ускорения для двух классов сопоставлены на рисунке {n}.",
+        max_height=99,
+    )
     rows = [["Часть", "Станки", "Файлы", "good", "bad", "Доля bad"]]
     for label, machines, indices in [
         ("Обучение", "M01, M02", train),
@@ -313,7 +388,12 @@ def build_report(
         rows.append(
             [label, machines, len(indices), len(indices) - bad, bad, f"{bad / len(indices):.1%}"]
         )
-    report.table("Разбиение для обычного теста и переноса на M03", rows, [40, 30, 23, 23, 23, 29])
+    report.table(
+        "Разбиение для обычного теста и переноса на M03",
+        rows,
+        [40, 30, 23, 23, 23, 29],
+        "Число файлов в каждой части приведено в таблице {n}.",
+    )
     report.p(
         "Обычный тест отвечает на вопрос, как модель работает на новых записях "
         "с уже знакомых станков. Для него отложены 25 % файлов M01 и M02 "
@@ -403,9 +483,14 @@ def build_report(
                 f"{choice.threshold:.4g}",
             ]
         )
-    report.table("Подбор параметров на обучающих файлах", rows, [25, 51, 50, 27, 17])
-    report.figure("cv")
-    report.figure("grid")
+    report.table(
+        "Подбор параметров на обучающих файлах",
+        rows,
+        [25, 51, 50, 27, 17],
+        "Сетки поиска и выбранные параметры приведены в таблице {n}.",
+    )
+    report.figure("cv", "Средние значения AP и разброс по разбиениям показаны на рисунке {n}.")
+    report.figure("grid", "Оценки SVM для разных сочетаний параметров приведены на рисунке {n}.")
     report.p(
         "При снижении порога модель обычно обнаруживает больше аномалий и чаще "
         "подаёт ложные тревоги. Полнота (recall) показывает, какую долю аномалий "
@@ -419,7 +504,7 @@ def build_report(
         "При равном F1 выбран больший порог, при котором тревог будет столько же "
         "или меньше. Для M03 применён тот же порог."
     )
-    report.figure("threshold")
+    report.figure("threshold", "Зависимость метрик от порога показана на рисунке {n}.")
 
     report.section("3 Эксперименты с деревьями")
     report.p(
@@ -429,7 +514,7 @@ def build_report(
         "минус сбалансированная доля верных ответов. Для ансамблей использована "
         "ранговая ошибка 1 − AP."
     )
-    report.figure("tree")
+    report.figure("tree", "Ошибки обучения и проверки дерева сопоставлены на рисунке {n}.")
     for name in (TREE, FOREST):
         raw, scaled = scaling[name]
         report.p(
@@ -450,10 +535,12 @@ def build_report(
         "сравниваются две скорости обучения. Меньший шаг меняет оценку медленнее, "
         "поэтому важно смотреть, какой результат достигается при разном числе деревьев."
     )
-    report.figure("forest_count")
-    report.figure("forest_parameters")
-    report.figure("boost_iterations")
-    report.figure("boost_parameters")
+    report.figure("forest_count", "Зависимость ошибки от числа деревьев показана на рисунке {n}.")
+    report.figure("forest_parameters", "Влияние параметров леса на AP показано на рисунке {n}.")
+    report.figure(
+        "boost_iterations", "Изменение ошибки бустинга по итерациям показано на рисунке {n}."
+    )
+    report.figure("boost_parameters", "Влияние параметров бустинга на AP показано на рисунке {n}.")
 
     report.section("4 Итоговая проверка и перенос")
     report.p(
@@ -473,9 +560,13 @@ def build_report(
     )
     test_tables(report, "Обычный тест", standard)
     test_tables(report, "Перенос на M03", transfer)
-    report.figure("roc_pr")
-    report.figure("matrix")
-    report.figure("transfer")
+    report.figure("roc_pr", "Кривые ROC и точность–полнота приведены на рисунке {n}.")
+    report.figure(
+        "matrix", "Нормированные матрицы ошибок выбранной модели показаны на рисунке {n}."
+    )
+    report.figure(
+        "transfer", "Значения AP обычного теста и переноса на M03 сопоставлены на рисунке {n}."
+    )
     summary = [
         [
             "Модель",
@@ -504,6 +595,7 @@ def build_report(
         "Параметры и результаты обычной проверки и переноса на M03",
         summary,
         [23, 52, 23, 18, 18, 18, 18],
+        "Параметры моделей и результаты обоих тестов собраны в таблице {n}.",
     )
     report.p(
         f"Доли аномалий составляют {sum(records[i].label for i in test) / len(test):.1%} "
@@ -524,9 +616,11 @@ def build_report(
     report.p(
         f"По средней AP на обучении выбрали модель «{time_winner}». В обоих тестах "
         "для каждого метода использовали один и тот же обученный классификатор и порог. "
-        "Последний столбец таблицы показывает AP августа за вычетом AP раннего теста."
+        "Разность AP рассчитана как AP августа за вычетом AP раннего теста."
     )
-    report.figure("time_transfer")
+    report.figure(
+        "time_transfer", "Значения AP раннего и августовского тестов сопоставлены на рисунке {n}."
+    )
     time_rows = [
         [
             "Модель",
@@ -561,6 +655,7 @@ def build_report(
         "Сравнение раннего и августовского тестов при одном обучении",
         time_rows,
         [19, 38, 13, 23, 15, 14, 15, 14, 19],
+        "Последний столбец таблицы {n} показывает разность AP двух тестов.",
     )
     for name in dict.fromkeys((time_winner, "SVM", FOREST)):
         _, false_alarms, missed, detected = later[name].matrix.ravel()
@@ -579,7 +674,7 @@ def build_report(
         "заменять друг друга. Отрезки на графике показывают стандартное отклонение "
         "по пяти проверочным частям и 12 повторениям."
     )
-    report.figure("importance")
+    report.figure("importance", "Результаты перестановки признаков показаны на рисунке {n}.")
     for title, indices, evaluation in [
         ("Обычный тест", test, standard[winner]),
         ("Перенос на M03", moved, transfer[winner]),
@@ -595,6 +690,7 @@ def build_report(
                 f"{title}. Операции с ошибками модели «{winner}»",
                 [["Станок / операция", "good", "Ложные тревоги", "bad", "Пропуски"], *rows],
                 [48, 24, 36, 24, 36],
+                f"Ошибки по операциям для выборки «{title}» приведены в таблице {{n}}.",
             )
         if title == "Перенос на M03" and fp:
             examples = sorted((row for row in rows if row[2]), key=lambda row: -row[2])[:2]
@@ -673,5 +769,8 @@ def build_report(
     report.p(
         "5 ГОСТ 7.32-2017. Отчёт о научно-исследовательской работе. Структура и правила "
         "оформления. Москва, Стандартинформ, 2017."
+    )
+    extent.counts = (
+        f"1 кн., {report.image_count} рис., {report.table_count} табл., 5 источн., 0 прил"
     )
     report.save(path)
