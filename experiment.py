@@ -26,6 +26,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import (
     GridSearchCV,
+    LeaveOneGroupOut,
     StratifiedKFold,
     cross_val_predict,
     cross_val_score,
@@ -42,6 +43,7 @@ from cnc_data import Recording, SignalFeatures
 SEED = 42
 FOLDS = 5
 MAIN = "average_precision"
+TRANSFER_REVIEW_FRACTION = 0.05
 FOREST = "Лес"
 BOOST = "Бустинг"
 TREE = "Дерево"
@@ -81,6 +83,13 @@ class Evaluation:
     prediction: Labels
     metrics: dict[str, float]
     matrix: Labels
+
+
+@dataclass
+class MachineTransfer:
+    winner: str
+    choices: dict[str, Selection]
+    validation: dict[str, dict[str, Evaluation]]
 
 
 def pipeline(model: BaseEstimator, scale: bool = False) -> Pipeline:
@@ -191,9 +200,13 @@ def operating_threshold(y: Labels, scores: FloatArray) -> float:
 
 
 def select(
-    x: Paths, y: Labels, cv: StratifiedKFold, models: dict[str, Candidate]
+    x: Paths,
+    y: Labels,
+    cv: StratifiedKFold | list[tuple[Labels, Labels]],
+    models: dict[str, Candidate],
 ) -> dict[str, Selection]:
     selected = {}
+    n_splits = len(cv) if isinstance(cv, list) else cv.get_n_splits()
     for name, candidate in models.items():
         print(f"Подбор: {name}", flush=True)
         prefix = SVM_PREFIX if name == SVM else "model__"
@@ -207,7 +220,7 @@ def select(
         search.fit(x, y)
         index = search.best_index_
         fold_scores = np.array(
-            [search.cv_results_[f"split{i}_test_score"][index] for i in range(FOLDS)]
+            [search.cv_results_[f"split{i}_test_score"][index] for i in range(n_splits)]
         )
         oof = cross_val_predict(search.best_estimator_, x, y, cv=cv, method="predict_proba")[:, 1]
         params = {key.removeprefix(prefix): val for key, val in search.best_params_.items()}
@@ -224,7 +237,11 @@ def select(
 
 def evaluate(selection: Selection, x: Paths, y: Labels) -> Evaluation:
     score = selection.model.predict_proba(x)[:, 1]
-    pred = (score >= selection.threshold).astype(int)
+    return evaluate_scores(y, score, selection.threshold)
+
+
+def evaluate_scores(y: Labels, score: FloatArray, threshold: float) -> Evaluation:
+    pred = (score >= threshold).astype(int)
     precision, recall, _ = precision_recall_curve(y, score)
     metrics = {
         "Accuracy": accuracy_score(y, pred),
@@ -237,6 +254,49 @@ def evaluate(selection: Selection, x: Paths, y: Labels) -> Evaluation:
         "AP": average_precision_score(y, score),
     }
     return Evaluation(score, pred, metrics, confusion_matrix(y, pred, labels=[0, 1]))
+
+
+def review_threshold(scores: FloatArray) -> float:
+    """Порог для ручного просмотра не более 5 % записей одной партии."""
+    budget = int(len(scores) * TRANSFER_REVIEW_FRACTION)
+    boundary = len(scores) - budget - 1
+    # Если несколько записей совпали на границе, вся группа остаётся ниже порога.
+    return float(np.nextafter(np.partition(scores, boundary)[boundary], np.inf))
+
+
+def evaluate_review(
+    selection: Selection,
+    x: Paths,
+    y: Labels,
+) -> tuple[Evaluation, float]:
+    scores = selection.model.predict_proba(x)[:, 1]
+    threshold = review_threshold(scores)
+    return evaluate_scores(y, scores, threshold), threshold
+
+
+def select_machine_transfer(x: Paths, y: Labels, machines: Paths) -> MachineTransfer:
+    if set(machines) != {"M01", "M02"}:
+        raise ValueError("Для подбора переноса нужны только обучающие файлы M01 и M02")
+    folds = list(LeaveOneGroupOut().split(x, y, machines))
+    models = candidates()
+    del models[DUMMY]
+    choices = select(x, y, folds, models)
+    validation = {}
+    for name, choice in choices.items():
+        validation[name] = {
+            str(machines[test[0]]): evaluate_scores(
+                y[test], choice.oof[test], review_threshold(choice.oof[test])
+            )
+            for _, test in folds
+        }
+    winner = max(
+        choices,
+        key=lambda name: (
+            np.mean([result.metrics["Recall"] for result in validation[name].values()]),
+            choices[name].scores.mean(),
+        ),
+    )
+    return MachineTransfer(winner, choices, validation)
 
 
 def evaluate_time_transfer(

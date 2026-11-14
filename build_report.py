@@ -20,11 +20,13 @@ from experiment import (
     boosting_error,
     candidates,
     evaluate,
+    evaluate_review,
     evaluate_time_transfer,
     feature_importance,
     forest_error,
     scale_check,
     select,
+    select_machine_transfer,
     split,
     time_split,
     tree_error,
@@ -61,6 +63,7 @@ def main() -> None:
     raw_figures(figures, records, y, train)
     cv = StratifiedKFold(FOLDS, shuffle=True, random_state=SEED)
     x_train, y_train = paths[train], y[train]
+    train_machines = np.array([records[i].machine for i in train])
     with threadpool_limits(limits=1):
         choices = select(x_train, y_train, cv, candidates())
         winner = max(choices, key=lambda name: choices[name].scores.mean())
@@ -75,6 +78,9 @@ def main() -> None:
             boosting_error(x_train, y_train, cv, choices[BOOST]),
             feature_importance(x_train, y_train, cv, choices[winner]),
         )
+        print("Подбор для переноса между станками", flush=True)
+        machine_transfer = select_machine_transfer(x_train, y_train, train_machines)
+        transfer_choice = machine_transfer.choices[machine_transfer.winner]
         print("Подбор для переноса во времени", flush=True)
         time_choices, early_test, later = evaluate_time_transfer(paths, y, time_indices, cv)
         print("Итоговая оценка на отложенных выборках", flush=True)
@@ -86,14 +92,27 @@ def main() -> None:
             for name, choice in choices.items()
         }
 
+        baseline_review, baseline_threshold = evaluate_review(
+            choices[winner], paths[transfer], y[transfer]
+        )
+        machine_test, machine_threshold = evaluate_review(
+            transfer_choice, paths[transfer], y[transfer]
+        )
+
     test_figures(figures, ordinary, moved, winner, y[test], early_test, later)
     with (BUILD / "metrics.csv").open("w", encoding="utf-8-sig", newline="") as stream:
         writer = csv.writer(stream)
         metrics = list(ordinary[winner].metrics)
         writer.writerow(["sample", "model", "cv_ap", "cv_ap_std", "threshold", *metrics])
+        review_thresholds = {
+            "transfer_review_baseline": baseline_threshold,
+            "transfer_review": machine_threshold,
+        }
         for sample, values, settings in (
             ("ordinary", ordinary, choices),
             ("transfer", moved, choices),
+            ("transfer_review_baseline", {winner: baseline_review}, choices),
+            ("transfer_review", {machine_transfer.winner: machine_test}, machine_transfer.choices),
             ("time_early", early_test, time_choices),
             ("time_august", later, time_choices),
         ):
@@ -105,7 +124,7 @@ def main() -> None:
                         name,
                         choice.scores.mean(),
                         choice.scores.std(),
-                        choice.threshold,
+                        review_thresholds.get(sample, choice.threshold),
                         *value.metrics.values(),
                     ]
                 )
@@ -124,6 +143,11 @@ def main() -> None:
         time_choices,
         early_test,
         later,
+        machine_transfer,
+        machine_test,
+        machine_threshold,
+        baseline_review,
+        baseline_threshold,
     )
     print(target, flush=True)
 

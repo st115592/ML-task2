@@ -29,7 +29,15 @@ from reportlab.platypus.doctemplate import IndexingFlowable
 from reportlab.platypus.tableofcontents import TableOfContents
 
 from cnc_data import Recording
-from experiment import FOREST, TREE, Evaluation, Selection, candidates
+from experiment import (
+    FOREST,
+    TREE,
+    TRANSFER_REVIEW_FRACTION,
+    Evaluation,
+    MachineTransfer,
+    Selection,
+    candidates,
+)
 from figures import Figures
 
 WIDTH = 170 * mm
@@ -296,6 +304,11 @@ def build_report(
     time_choices: dict[str, Selection],
     early_test: dict[str, Evaluation],
     later: dict[str, Evaluation],
+    machine_transfer: MachineTransfer,
+    machine_test: Evaluation,
+    machine_threshold: float,
+    baseline_review: Evaluation,
+    baseline_threshold: float,
 ) -> None:
     configure_fonts()
     report = Report(figures)
@@ -319,6 +332,9 @@ def build_report(
     train, test, moved = splits
     result = standard[winner].metrics
     target = transfer[winner].metrics
+    transfer_name = machine_transfer.winner
+    transfer_choice = machine_transfer.choices[transfer_name]
+    _, review_fp, review_fn, review_tp = machine_test.matrix.ravel()
     earlier, control, late = time_indices
     time_winner = max(time_choices, key=lambda name: time_choices[name].scores.mean())
     report.p(
@@ -329,6 +345,9 @@ def build_report(
         "Сопоставлены семь классификаторов. Выбор по средней точности класса bad на "
         f"перекрёстной проверке дал модель «{winner}». На обычном тесте AP={result['AP']:.3f} "
         f"и F1={result['F1']:.3f}. На M03 AP={target['AP']:.3f} и F1={target['F1']:.3f}. "
+        f"На M03 лес с порогом, выбранным на обучении, обнаружил "
+        f"{transfer[FOREST].matrix[1, 1]} аномалий при {transfer[FOREST].matrix[0, 1]} "
+        "ложных тревогах и предложен для дальнейшей проверки. "
         f"Для проверки переноса во времени модель «{time_winner}» обучили на более "
         "ранних записях. На данных августа 2021 года модель получила "
         f"AP {later[time_winner].metrics['AP']:.3f}."
@@ -604,7 +623,97 @@ def build_report(
         "сопоставлении AP и F1 также следует учитывать малое число аномальных файлов."
     )
 
-    report.section("5 Перенос на август 2021 года")
+    report.section("5 Отбор записей для проверки на новом станке")
+    report.p(
+        "На новом станке прежний порог SVM даёт слишком много тревог для ручной проверки. "
+        "Вместо автоматического решения об остановке станка рассмотрен отбор записей "
+        "для просмотра человеком. В этом эксперименте допустим просмотр до "
+        f"{TRANSFER_REVIEW_FRACTION:.0%} файлов каждой партии. Такой лимит задаёт нагрузку "
+        "на проверяющего. Цена пропуска аномалии в исходных данных не указана."
+    )
+    report.p(
+        "Для выбора модели использованы только обучающие файлы M01 и M02. "
+        "Каждый станок по очереди целиком откладывался. Параметры каждой модели "
+        "выбраны по средней AP двух проверок. Затем на каждом отложенном станке "
+        "оставили до 5 % записей с наибольшими оценками и посчитали долю найденных "
+        "аномалий. При одинаковой оценке на границе вся группа остаётся вне отбора. "
+        "Итоговую модель выбрали по средней полноте двух проверок, при равенстве "
+        "использовали AP."
+    )
+    rows = [["Модель", "Средняя AP", "Полнота M01", "Полнота M02", "Средняя полнота"]]
+    for name, checks in machine_transfer.validation.items():
+        first, second = (checks[machine].metrics["Recall"] for machine in ("M01", "M02"))
+        rows.append(
+            [
+                name,
+                f"{machine_transfer.choices[name].scores.mean():.3f}",
+                f"{first:.1%}",
+                f"{second:.1%}",
+                f"{(first + second) / 2:.1%}",
+            ]
+        )
+    report.table(
+        "Выбор модели для ручной проверки на M01 и M02",
+        rows,
+        [36, 30, 34, 34, 36],
+        "Результаты взаимной проверки станков приведены в таблице {n}.",
+    )
+    report.p(
+        f"Выбрана модель «{transfer_name}» с параметрами {parameters(transfer_choice.params)}. "
+        "После выбора её обучили на всей обучающей части M01 и M02. На M03 граница "
+        "отбора определяется только оценками файлов партии и заранее заданным лимитом. "
+        "Метки M03 использованы для подсчёта ошибок."
+    )
+    report.p(
+        "Для сравнения на той же партии оценили исходную модель с её прежним порогом "
+        "и с тем же лимитом ручной проверки. Это показывает, сколько даёт само "
+        "ограничение числа просмотров и сколько даёт выбор модели для переноса."
+    )
+    rows = [
+        ["Способ отбора", "Порог", "На просмотр", "Найдены", "Пропуски", "Ложные тревоги", "F1"]
+    ]
+    for name, threshold, result in (
+        (f"{winner}, прежний порог", choices[winner].threshold, transfer[winner]),
+        (f"{winner}, лимит 5 %", baseline_threshold, baseline_review),
+        (f"{transfer_name}, лимит 5 %", machine_threshold, machine_test),
+        ("Случайный лес", choices[FOREST].threshold, transfer[FOREST]),
+        ("Ближайшие соседи", choices["kNN"].threshold, transfer["kNN"]),
+    ):
+        _, fp, fn, tp = result.matrix.ravel()
+        rows.append([name, f"{threshold:.4g}", tp + fp, tp, fn, fp, f"{result.metrics['F1']:.3f}"])
+    report.table(
+        "Нагрузка на ручную проверку и ошибки на M03",
+        rows,
+        [44, 20, 22, 19, 20, 24, 21],
+        "Способы отбора на M03 сопоставлены в таблице {n}.",
+    )
+    report.p(
+        f"Лимит сократил очередь ручной проверки до {review_tp + review_fp} из {len(moved)} "
+        f"файлов, но модель «{transfer_name}» пропустила {review_fn} аномалий. "
+        "Ограничение числа просмотров само по себе даёт мало пользы, если в начало "
+        "очереди попадает слишком мало аномальных записей."
+    )
+    _, forest_fp, forest_fn, forest_tp = transfer[FOREST].matrix.ravel()
+    _, knn_fp, knn_fn, knn_tp = transfer["kNN"].matrix.ravel()
+    report.p(
+        f"Если важнее сохранить полноту обнаружения, для следующей проверки предлагаем "
+        f"случайный лес с порогом {choices[FOREST].threshold:.3f}. На M03 он "
+        f"направил на просмотр {forest_tp + forest_fp} записей, нашёл {forest_tp} из "
+        f"{forest_tp + forest_fn} аномалий и дал {forest_fp} ложных тревог. "
+        f"Если ручная проверка ограничена, вариант kNN даёт {knn_fp} ложных тревог, "
+        f"но пропускает {knn_fn} аномалии. По сравнению с kNN лес обнаружил "
+        f"ещё {forest_tp - knn_tp} аномалии ценой {forest_fp - knn_fp} дополнительных "
+        "ложных тревог. Выбор зависит от того, сколько стоит пропуск и сколько "
+        "записей успевает проверить оператор."
+    )
+    report.p(
+        "Пороги леса и kNN получены на обучающих файлах. Само предложение использовать "
+        "лес сделано после сравнения результатов на M03. Следующий шаг — зафиксировать "
+        "лес и его порог и проверить число пропусков и ложных тревог на следующем "
+        "станке. Здесь в тесте M03 всего девять аномалий."
+    )
+
+    report.section("6 Перенос на август 2021 года")
     late_bad = sum(records[i].label for i in late)
     report.p(
         f"Из записей M01 и M02 до августа 2021 года выделили ранний тест "
@@ -666,7 +775,7 @@ def build_report(
 
     test_tables(report, "Август 2021 года", later)
 
-    report.section("6 Интерпретация и инженерный разбор")
+    report.section("7 Интерпретация и инженерный разбор")
     report.p(
         "Чтобы понять, на какие измерения опирается выбранная модель, один признак "
         "перемешивали между файлами, сохраняя остальные. Если AP падает, модель "
@@ -717,18 +826,16 @@ def build_report(
     )
 
     report.section("ЗАКЛЮЧЕНИЕ")
-    winner_moved = max(transfer, key=lambda name: transfer[name].metrics["AP"])
-    best_f1 = max(transfer, key=lambda name: transfer[name].metrics["F1"])
-    tn, fp, fn, tp = transfer[winner].matrix.ravel()
+    _, baseline_fp, _, baseline_tp = transfer[winner].matrix.ravel()
     report.p(
-        f"Модель «{winner}» выбрана по средней AP на обучающих разбиениях. "
-        f"При переносе на M03 с прежним порогом она обнаружила {tp} из {tp + fn} аномалий "
-        f"и подала ложную тревогу для {fp} из {tn + fp} нормальных записей. "
-        f"На этом станке модель «{winner_moved}» лучше ранжировала аномалии "
-        f"(AP {transfer[winner_moved].metrics['AP']:.3f}), а модель «{best_f1}» "
-        f"получила лучший F1 при заранее выбранном пороге "
-        f"({transfer[best_f1].metrics['F1']:.3f}). Сравнение относится к одному "
-        "отложенному станку."
+        f"На новом станке предлагаем проверить случайный лес с порогом "
+        f"{choices[FOREST].threshold:.3f} как средство отбора записей для оператора. "
+        f"На M03 лес уменьшил число ложных тревог с {baseline_fp} до {forest_fp} "
+        f"и обнаружил {forest_tp} аномалий из {forest_tp + forest_fn}. "
+        f"Исходная модель «{winner}» обнаружила {baseline_tp} аномалий. "
+        f"При более жёстком ограничении на просмотры kNN нашёл {knn_tp} аномалий "
+        f"при {knn_fp} ложных тревогах. Эти результаты получены на M03. "
+        "Оценку выбранного решения следует подтвердить на следующем станке."
     )
     early_ap = early_test[time_winner].metrics["AP"]
     late_ap = later[time_winner].metrics["AP"]

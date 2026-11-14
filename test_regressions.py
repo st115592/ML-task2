@@ -193,3 +193,55 @@ def test_dataset_resumes_and_repairs_same_size_file(
     download_data.download_dataset(tmp_path)
     assert requests == [names[0]]
     assert paths[0].read_bytes() == payloads[names[0]]
+
+
+def test_review_threshold_respects_budget_and_ties() -> None:
+    scores = np.arange(40, dtype=float) / 40
+    assert np.count_nonzero(scores >= experiment.review_threshold(scores)) == 2
+    scores[-3:] = 0.99
+    assert np.count_nonzero(scores >= experiment.review_threshold(scores)) == 0
+    short_batch = np.array([0.2, 0.9])
+    assert np.count_nonzero(short_batch >= experiment.review_threshold(short_batch)) == 0
+
+
+def test_machine_transfer_holds_out_each_source_machine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    machines = np.repeat(["M01", "M02"], 40)
+    y = np.tile(np.r_[np.zeros(39, dtype=int), 1], 2)
+    x = np.arange(len(y)).astype(str)
+    model = experiment.BaseEstimator()
+    good = np.tile(np.arange(40) / 40, 2)
+    bad = good.copy()
+    bad[y == 1] = 0
+    expected = {"detects": good, "misses": bad}
+
+    def select(
+        paths: NDArray[np.str_],
+        labels: NDArray[np.int_],
+        cv: list[tuple[NDArray[np.int_], NDArray[np.int_]]],
+        candidates: dict[str, experiment.Candidate],
+    ) -> dict[str, experiment.Selection]:
+        np.testing.assert_array_equal(paths, x)
+        np.testing.assert_array_equal(labels, y)
+        assert experiment.DUMMY not in candidates
+        assert len(cv) == 2
+        for train, test in cv:
+            assert len(set(machines[train])) == len(set(machines[test])) == 1
+            assert set(machines[train]).isdisjoint(machines[test])
+        return {
+            name: experiment.Selection(model, {}, np.array([0.7, 0.9]), {}, 0.5, scores)
+            for name, scores in expected.items()
+        }
+
+    monkeypatch.setattr(experiment, "select", select)
+    result = experiment.select_machine_transfer(x, y, machines)
+    assert result.winner == "detects"
+    checks = result.validation["detects"]
+    assert set(checks) == {"M01", "M02"}
+    for evaluation in checks.values():
+        assert evaluation.metrics["Recall"] == 1
+        assert evaluation.prediction.sum() == 2
+    machines[0] = "M03"
+    with pytest.raises(ValueError, match="только обучающие файлы"):
+        experiment.select_machine_transfer(x, y, machines)
