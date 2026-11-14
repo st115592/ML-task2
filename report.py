@@ -30,6 +30,7 @@ from reportlab.platypus.tableofcontents import TableOfContents
 
 from cnc_data import Recording
 from experiment import (
+    BOOST,
     FOREST,
     TREE,
     TRANSFER_REVIEW_FRACTION,
@@ -40,7 +41,9 @@ from experiment import (
 )
 from figures import Figures
 
-WIDTH = 170 * mm
+LEFT_MARGIN = 30 * mm
+RIGHT_MARGIN = 15 * mm
+WIDTH = A4[0] - LEFT_MARGIN - RIGHT_MARGIN
 
 
 def configure_fonts() -> None:
@@ -198,13 +201,16 @@ class Report:
         )
         self.story.append(caption)
         cells = [[Paragraph(escape(str(v)), self.style["cell"]) for v in row] for row in rows]
-        table = Table(cells, colWidths=[w * mm for w in widths], repeatRows=1, hAlign="CENTER")
+        scale = min(mm, WIDTH / sum(widths))
+        table = Table(cells, colWidths=[w * scale for w in widths], repeatRows=1, hAlign="CENTER")
         table.setStyle(
             TableStyle(
                 [
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#e9eff3")),
                     ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#8995a0")),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
                     ("TOPPADDING", (0, 0), (-1, -1), 5),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
                 ]
@@ -216,8 +222,8 @@ class Report:
         doc = ReportDocument(
             str(path),
             pagesize=A4,
-            leftMargin=30 * mm,
-            rightMargin=10 * mm,
+            leftMargin=LEFT_MARGIN,
+            rightMargin=RIGHT_MARGIN,
             topMargin=20 * mm,
             bottomMargin=20 * mm,
             title="Нормальный и аномальный режим фрезерного станка",
@@ -307,10 +313,8 @@ def build_report(
     machine_transfer: MachineTransfer,
     machine_test: Evaluation,
     machine_threshold: float,
-    baseline_review: Evaluation,
-    baseline_threshold: float,
-    forest_review: Evaluation,
-    forest_threshold: float,
+    limited_review: dict[str, Evaluation],
+    limited_thresholds: dict[str, float],
 ) -> None:
     configure_fonts()
     report = Report(figures)
@@ -322,6 +326,7 @@ def build_report(
     report.story.append(Spacer(1, 13 * mm))
     report.p("Клименко Георгий", "center")
     report.story.append(Spacer(1, 104 * mm))
+    report.p("Санкт-Петербург", "center")
     report.p("2026", "center")
 
     report.section("РЕФЕРАТ")
@@ -634,6 +639,12 @@ def build_report(
         "на проверяющего. Цена пропуска аномалии в исходных данных не указана."
     )
     report.p(
+        f"Это пакетная проверка. Одна партия включает все {len(moved)} записей M03. "
+        "Лимит округляется вниз до целого числа записей. При 19 записях он равен нулю, "
+        "при 20 допускается один просмотр. Для работы на станке ещё предстоит выбрать "
+        "размер партии, например по длительности смены или по числу накопленных файлов."
+    )
+    report.p(
         "Для выбора модели использованы только обучающие файлы M01 и M02. "
         "Каждый станок по очереди целиком откладывался. Параметры каждой модели "
         "выбраны по средней AP двух проверок. Затем на каждом отложенном станке "
@@ -667,9 +678,9 @@ def build_report(
         "Метки M03 использованы для подсчёта ошибок."
     )
     report.p(
-        "На одной и той же партии M03 сравнили исходную SVM, модель, выбранную "
-        "по M01 и M02, и случайный лес при общем лимите ручной проверки. "
-        "Дополнительно показаны результаты моделей с порогами, полученными на обучении."
+        "На партии M03 одинаковый лимит применили к оценкам всех семи моделей. "
+        "Отдельно показана логистическая регрессия с параметрами, выбранными по "
+        "взаимному переносу M01 и M02, и три варианта с порогами из обучения."
     )
     rows = [
         [
@@ -684,14 +695,23 @@ def build_report(
     ]
     for name, threshold, result, limited in (
         (f"{winner}, прежний порог", choices[winner].threshold, transfer[winner], False),
-        (f"{winner}, лимит 5 %", baseline_threshold, baseline_review, True),
-        (f"{transfer_name}, лимит 5 %", machine_threshold, machine_test, True),
-        ("Лес, лимит 5 %", forest_threshold, forest_review, True),
+        *(
+            (
+                f"{name}, лимит 5 %",
+                limited_thresholds[name],
+                result,
+                True,
+            )
+            for name, result in limited_review.items()
+        ),
+        (f"{transfer_name} по станкам, лимит 5 %", machine_threshold, machine_test, True),
         ("Случайный лес, фикс. порог", choices[FOREST].threshold, transfer[FOREST], False),
         ("Ближайшие соседи", choices["kNN"].threshold, transfer["kNN"], False),
     ):
         _, fp, fn, tp = result.matrix.ravel()
-        cut = f"{threshold:.4g}" + ("*" if limited else "")
+        cut = "—" if limited and tp + fp == 0 else f"{threshold:.4g}"
+        if limited:
+            cut += "*"
         rows.append([name, cut, tp + fp, tp, fn, fp, f"{result.metrics['F1']:.3f}"])
     report.table(
         "Нагрузка на ручную проверку и ошибки на M03",
@@ -703,17 +723,21 @@ def build_report(
         "* Округлённые пороги для партии M03. При лимите 5 % порог рассчитывается заново "
         "по оценкам каждой партии. Для воспроизведения результатов M03 используйте "
         "точные значения из столбца threshold файла build/metrics.csv в строках "
-        "transfer_review_baseline, transfer_review и transfer_review_forest."
+        "transfer_review_models и transfer_review. Если оценки совпадают на границе, "
+        "модель может использовать лишь часть лимита. Прочерк означает, что отбор пуст."
     )
-    _, forest_review_fp, forest_review_fn, forest_review_tp = forest_review.matrix.ravel()
-    _, svm_review_fp, _, svm_review_tp = baseline_review.matrix.ravel()
+    _, forest_review_fp, forest_review_fn, forest_review_tp = limited_review[FOREST].matrix.ravel()
+    _, boost_review_fp, _, boost_review_tp = limited_review[BOOST].matrix.ravel()
+    _, svm_review_fp, _, svm_review_tp = limited_review[winner].matrix.ravel()
     max_reviews = int(len(moved) * TRANSFER_REVIEW_FRACTION)
     report.p(
         f"Лимит на M03 составляет {max_reviews} из {len(moved)} записей. При одном "
         f"лимите лес нашёл {forest_review_tp} из {forest_review_tp + forest_review_fn} "
-        f"аномалий за {forest_review_tp + forest_review_fp} просмотров, SVM — "
-        f"{svm_review_tp} за {svm_review_tp + svm_review_fp}. Лес оставил всю группу "
-        "с одинаковой оценкой на границе вне отбора, поэтому очередь короче лимита. "
+        f"аномалий за {forest_review_tp + forest_review_fp} просмотра. "
+        f"Бустинг нашёл {boost_review_tp} аномалий при {boost_review_tp + boost_review_fp} "
+        f"просмотрах. У леса было {forest_review_fp} ложных тревог, у бустинга — "
+        f"{boost_review_fp}. SVM нашла {svm_review_tp} аномалий при "
+        f"{svm_review_tp + svm_review_fp} просмотрах. "
         "Сравнение при общем лимите выполнено после изучения результатов M03."
     )
     report.p(
@@ -747,8 +771,8 @@ def build_report(
     late_bad = sum(late_by_machine.values())
     report.p(
         f"Из записей M01 и M02 до августа 2021 года выделили ранний тест "
-        f"({len(control)} файлов, из них {sum(records[i].label for i in control)} "
-        f"аномальных). Остальные {len(earlier)} ранних файлов использовали для обучения "
+        f"из {len(control)} записей, из них {sum(records[i].label for i in control)} "
+        f"аномальных. Остальные {len(earlier)} ранних файлов использовали для обучения "
         "и подбора параметров и порогов. В августовский тест вошли все "
         f"{len(late)} записей этих двух станков, из них {late_bad} аномальных."
     )
@@ -793,7 +817,7 @@ def build_report(
     report.table(
         "Сравнение раннего и августовского тестов при одном обучении",
         time_rows,
-        [19, 38, 13, 23, 15, 14, 15, 14, 19],
+        [18, 36, 14, 21, 14, 16, 14, 14, 18],
         "Последний столбец таблицы {n} показывает разность AP двух тестов.",
     )
     for name in dict.fromkeys((time_winner, "SVM", FOREST)):
@@ -910,7 +934,8 @@ def build_report(
         "с порогом, который рассчитывается заново по оценкам каждой партии. "
         f"На M03 он дал {forest_review_tp + forest_review_fp} просмотра при лимите "
         f"{max_reviews}, обнаружил {forest_review_tp} из {forest_review_tp + forest_review_fn} "
-        f"аномалий и вызвал {forest_review_fp} ложных тревог."
+        f"аномалий и вызвал {forest_review_fp} ложных тревог. Бустинг нашёл "
+        f"{boost_review_tp} аномалий при {boost_review_fp} ложных тревогах."
     )
     report.p(
         f"Если допустима более длинная очередь, можно проверить лес с фиксированным "

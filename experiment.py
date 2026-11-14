@@ -258,6 +258,8 @@ def evaluate_scores(y: Labels, score: FloatArray, threshold: float) -> Evaluatio
 
 def review_threshold(scores: FloatArray) -> float:
     """Порог для ручного просмотра не более 5 % записей одной партии."""
+    if scores.size == 0:
+        return float("inf")
     budget = int(len(scores) * TRANSFER_REVIEW_FRACTION)
     boundary = len(scores) - budget - 1
     # Если несколько записей совпали на границе, вся группа остаётся ниже порога.

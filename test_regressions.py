@@ -195,6 +195,13 @@ def test_dataset_resumes_and_repairs_same_size_file(
     assert paths[0].read_bytes() == payloads[names[0]]
 
 
+@pytest.mark.parametrize(("size", "expected"), [(0, 0), (19, 0), (20, 1)])
+def test_review_threshold_at_minimum_batch_size(size: int, expected: int) -> None:
+    scores = np.linspace(0, 1, size)
+    threshold = experiment.review_threshold(scores)
+    assert np.count_nonzero(scores >= threshold) == expected
+
+
 def test_review_threshold_respects_budget_and_ties() -> None:
     scores = np.arange(40, dtype=float) / 40
     assert np.count_nonzero(scores >= experiment.review_threshold(scores)) == 2
