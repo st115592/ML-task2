@@ -21,9 +21,11 @@ from experiment import (
     candidates,
     evaluate,
     evaluate_review,
+    evaluate_scores,
     evaluate_time_transfer,
     feature_importance,
     forest_error,
+    review_threshold,
     scale_check,
     select,
     select_machine_transfer,
@@ -92,9 +94,10 @@ def main() -> None:
             for name, choice in choices.items()
         }
 
-        baseline_review, baseline_threshold = evaluate_review(
-            choices[winner], paths[transfer], y[transfer]
-        )
+        baseline_threshold = review_threshold(moved[winner].scores)
+        baseline_review = evaluate_scores(y[transfer], moved[winner].scores, baseline_threshold)
+        forest_threshold = review_threshold(moved[FOREST].scores)
+        forest_review = evaluate_scores(y[transfer], moved[FOREST].scores, forest_threshold)
         machine_test, machine_threshold = evaluate_review(
             transfer_choice, paths[transfer], y[transfer]
         )
@@ -106,12 +109,14 @@ def main() -> None:
         writer.writerow(["sample", "model", "cv_ap", "cv_ap_std", "threshold", *metrics])
         review_thresholds = {
             "transfer_review_baseline": baseline_threshold,
+            "transfer_review_forest": forest_threshold,
             "transfer_review": machine_threshold,
         }
         for sample, values, settings in (
             ("ordinary", ordinary, choices),
             ("transfer", moved, choices),
             ("transfer_review_baseline", {winner: baseline_review}, choices),
+            ("transfer_review_forest", {FOREST: forest_review}, choices),
             ("transfer_review", {machine_transfer.winner: machine_test}, machine_transfer.choices),
             ("time_early", early_test, time_choices),
             ("time_august", later, time_choices),
@@ -148,6 +153,8 @@ def main() -> None:
         machine_threshold,
         baseline_review,
         baseline_threshold,
+        forest_review,
+        forest_threshold,
     )
     print(target, flush=True)
 

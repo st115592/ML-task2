@@ -309,6 +309,8 @@ def build_report(
     machine_threshold: float,
     baseline_review: Evaluation,
     baseline_threshold: float,
+    forest_review: Evaluation,
+    forest_threshold: float,
 ) -> None:
     configure_fonts()
     report = Report(figures)
@@ -665,9 +667,9 @@ def build_report(
         "Метки M03 использованы для подсчёта ошибок."
     )
     report.p(
-        "Для сравнения на той же партии оценили исходную модель с её прежним порогом "
-        "и с тем же лимитом ручной проверки. Это показывает, сколько даёт само "
-        "ограничение числа просмотров и сколько даёт выбор модели для переноса."
+        "На одной и той же партии M03 сравнили исходную SVM, модель, выбранную "
+        "по M01 и M02, и случайный лес при общем лимите ручной проверки. "
+        "Дополнительно показаны результаты моделей с порогами, полученными на обучении."
     )
     rows = [
         ["Способ отбора", "Порог", "На просмотр", "Найдены", "Пропуски", "Ложные тревоги", "F1"]
@@ -676,16 +678,32 @@ def build_report(
         (f"{winner}, прежний порог", choices[winner].threshold, transfer[winner]),
         (f"{winner}, лимит 5 %", baseline_threshold, baseline_review),
         (f"{transfer_name}, лимит 5 %", machine_threshold, machine_test),
+        ("Лес, лимит 5 %", forest_threshold, forest_review),
         ("Случайный лес", choices[FOREST].threshold, transfer[FOREST]),
         ("Ближайшие соседи", choices["kNN"].threshold, transfer["kNN"]),
     ):
         _, fp, fn, tp = result.matrix.ravel()
-        rows.append([name, f"{threshold:.4g}", tp + fp, tp, fn, fp, f"{result.metrics['F1']:.3f}"])
+        cut = f"{threshold:.4g}"
+        if result is forest_review:
+            # Из-за округления 0,35000000000000003 выглядит как фиксированный 0,350.
+            cut = f">{np.nextafter(threshold, -np.inf):.4g}"
+        rows.append([name, cut, tp + fp, tp, fn, fp, f"{result.metrics['F1']:.3f}"])
     report.table(
         "Нагрузка на ручную проверку и ошибки на M03",
         rows,
         [44, 20, 22, 19, 20, 24, 21],
         "Способы отбора на M03 сопоставлены в таблице {n}.",
+    )
+    _, forest_review_fp, forest_review_fn, forest_review_tp = forest_review.matrix.ravel()
+    _, svm_review_fp, _, svm_review_tp = baseline_review.matrix.ravel()
+    max_reviews = int(len(moved) * TRANSFER_REVIEW_FRACTION)
+    report.p(
+        f"Лимит на M03 составляет {max_reviews} из {len(moved)} записей. При одном "
+        f"лимите лес нашёл {forest_review_tp} из {forest_review_tp + forest_review_fn} "
+        f"аномалий за {forest_review_tp + forest_review_fp} просмотров, SVM — "
+        f"{svm_review_tp} за {svm_review_tp + svm_review_fp}. Лес оставил всю группу "
+        "с одинаковой оценкой на границе вне отбора, поэтому очередь короче лимита. "
+        "Сравнение при общем лимите выполнено после изучения результатов M03."
     )
     report.p(
         f"Лимит сократил очередь ручной проверки до {review_tp + review_fp} из {len(moved)} "
@@ -714,7 +732,8 @@ def build_report(
     )
 
     report.section("6 Перенос на август 2021 года")
-    late_bad = sum(records[i].label for i in late)
+    late_by_machine = Counter(records[i].machine for i in late if records[i].label)
+    late_bad = sum(late_by_machine.values())
     report.p(
         f"Из записей M01 и M02 до августа 2021 года выделили ранний тест "
         f"({len(control)} файлов, из них {sum(records[i].label for i in control)} "
@@ -773,6 +792,15 @@ def build_report(
             f"аномалий. Число ложных тревог — {false_alarms}."
         )
 
+    _, later_forest_fp, later_forest_fn, later_forest_tp = later[FOREST].matrix.ravel()
+    report.p(
+        f"Для следующего периода стоит зафиксировать лес, обученный на ранних файлах, "
+        f"и его порог {time_choices[FOREST].threshold:.3f}. В августе он обнаружил "
+        f"{later_forest_tp} из {late_bad} аномалий при {later_forest_fp} ложных тревогах. "
+        f"Из {late_bad} аномалий {late_by_machine['M01']} относятся к M01 и "
+        f"{late_by_machine['M02']} — к M02. При следующей проверке нужно считать пропуски "
+        "и ложные тревоги отдельно для каждого станка."
+    )
     test_tables(report, "Август 2021 года", later)
 
     report.section("7 Интерпретация и инженерный разбор")
@@ -825,6 +853,45 @@ def build_report(
         "причину отклонения. Проверка переноса характеризует один отложенный станок."
     )
 
+    # Сравнение строится по меткам и решениям тех же моделей, что в таблице переноса.
+    anomaly_indices = [i for i in moved if records[i].label == 1]
+    misses = {
+        name: {
+            i
+            for i, predicted in zip(moved, transfer[name].prediction)
+            if records[i].label == 1 and predicted == 0
+        }
+        for name in (FOREST, "kNN")
+    }
+    operations = sorted({records[i].operation for i in misses[FOREST] | misses["kNN"]})
+    if operations:
+        rows = [["Операция", "Аномалии", "Пропуски леса", "Пропуски kNN"]]
+        for operation in operations:
+            files = {i for i in anomaly_indices if records[i].operation == operation}
+            rows.append(
+                [
+                    operation,
+                    len(files),
+                    len(files & misses[FOREST]),
+                    len(files & misses["kNN"]),
+                ]
+            )
+        report.table(
+            "Пропуски случайного леса и kNN по операциям на M03",
+            rows,
+            [38, 38, 47, 47],
+            "Операции с пропущенными аномалиями приведены в таблице {n}.",
+        )
+        common = misses[FOREST] & misses["kNN"]
+        if common:
+            names = ", ".join(sorted({records[i].operation for i in common}))
+            report.p(
+                f"Обе модели пропустили одни и те же записи в операциях {names} "
+                f"({len(common)}). При следующей проверке стоит отдельно просмотреть "
+                "аномальные записи этих операций. По имеющимся меткам нельзя установить "
+                "физическую причину пропуска."
+            )
+
     report.section("ЗАКЛЮЧЕНИЕ")
     _, baseline_fp, _, baseline_tp = transfer[winner].matrix.ravel()
     report.p(
@@ -833,9 +900,10 @@ def build_report(
         f"На M03 лес уменьшил число ложных тревог с {baseline_fp} до {forest_fp} "
         f"и обнаружил {forest_tp} аномалий из {forest_tp + forest_fn}. "
         f"Исходная модель «{winner}» обнаружила {baseline_tp} аномалий. "
-        f"При более жёстком ограничении на просмотры kNN нашёл {knn_tp} аномалий "
-        f"при {knn_fp} ложных тревогах. Эти результаты получены на M03. "
-        "Оценку выбранного решения следует подтвердить на следующем станке."
+        f"При лимите {TRANSFER_REVIEW_FRACTION:.0%} лес обнаружил {forest_review_tp} "
+        f"аномалий при {forest_review_tp + forest_review_fp} просмотрах, SVM — "
+        f"{svm_review_tp} при {svm_review_tp + svm_review_fp}. Оба режима отбора "
+        "лесом следует подтвердить на следующем станке."
     )
     early_ap = early_test[time_winner].metrics["AP"]
     late_ap = later[time_winner].metrics["AP"]
@@ -850,8 +918,10 @@ def build_report(
         f"{detected} из {late_bad} аномалий, число ложных тревог — {alarms}. "
         f"У SVM AP изменилась с {svm_early:.3f} до {svm_late:.3f}. "
         f"У случайного леса AP изменилась с {forest_early:.3f} до {forest_late:.3f}. "
-        f"Августовский тест включает только {late_bad} аномалий, поэтому одна ошибка "
-        "может заметно изменить результат."
+        f"Для следующей временной проверки предложен лес с прежним порогом. "
+        f"В августе он пропустил {later_forest_fn} из {late_bad} аномалий и дал "
+        f"{later_forest_fp} ложных тревог. Такой результат требует проверки на более "
+        "крупной выборке, где аномалии представлены на обоих станках."
     )
 
     report.section("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ")
