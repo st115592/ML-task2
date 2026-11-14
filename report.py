@@ -672,27 +672,38 @@ def build_report(
         "Дополнительно показаны результаты моделей с порогами, полученными на обучении."
     )
     rows = [
-        ["Способ отбора", "Порог", "На просмотр", "Найдены", "Пропуски", "Ложные тревоги", "F1"]
+        [
+            "Способ отбора",
+            "Порог, окр.",
+            "На просмотр",
+            "Найдены",
+            "Пропуски",
+            "Ложные тревоги",
+            "F1",
+        ]
     ]
-    for name, threshold, result in (
-        (f"{winner}, прежний порог", choices[winner].threshold, transfer[winner]),
-        (f"{winner}, лимит 5 %", baseline_threshold, baseline_review),
-        (f"{transfer_name}, лимит 5 %", machine_threshold, machine_test),
-        ("Лес, лимит 5 %", forest_threshold, forest_review),
-        ("Случайный лес", choices[FOREST].threshold, transfer[FOREST]),
-        ("Ближайшие соседи", choices["kNN"].threshold, transfer["kNN"]),
+    for name, threshold, result, limited in (
+        (f"{winner}, прежний порог", choices[winner].threshold, transfer[winner], False),
+        (f"{winner}, лимит 5 %", baseline_threshold, baseline_review, True),
+        (f"{transfer_name}, лимит 5 %", machine_threshold, machine_test, True),
+        ("Лес, лимит 5 %", forest_threshold, forest_review, True),
+        ("Случайный лес, фикс. порог", choices[FOREST].threshold, transfer[FOREST], False),
+        ("Ближайшие соседи", choices["kNN"].threshold, transfer["kNN"], False),
     ):
         _, fp, fn, tp = result.matrix.ravel()
-        cut = f"{threshold:.4g}"
-        if result is forest_review:
-            # Из-за округления 0,35000000000000003 выглядит как фиксированный 0,350.
-            cut = f">{np.nextafter(threshold, -np.inf):.4g}"
+        cut = f"{threshold:.4g}" + ("*" if limited else "")
         rows.append([name, cut, tp + fp, tp, fn, fp, f"{result.metrics['F1']:.3f}"])
     report.table(
         "Нагрузка на ручную проверку и ошибки на M03",
         rows,
         [44, 20, 22, 19, 20, 24, 21],
         "Способы отбора на M03 сопоставлены в таблице {n}.",
+    )
+    report.p(
+        "* Округлённые пороги для партии M03. При лимите 5 % порог рассчитывается заново "
+        "по оценкам каждой партии. Для воспроизведения результатов M03 используйте "
+        "точные значения из столбца threshold файла build/metrics.csv в строках "
+        "transfer_review_baseline, transfer_review и transfer_review_forest."
     )
     _, forest_review_fp, forest_review_fn, forest_review_tp = forest_review.matrix.ravel()
     _, svm_review_fp, _, svm_review_tp = baseline_review.matrix.ravel()
@@ -895,15 +906,20 @@ def build_report(
     report.section("ЗАКЛЮЧЕНИЕ")
     _, baseline_fp, _, baseline_tp = transfer[winner].matrix.ravel()
     report.p(
-        f"На новом станке предлагаем проверить случайный лес с порогом "
-        f"{choices[FOREST].threshold:.3f} как средство отбора записей для оператора. "
-        f"На M03 лес уменьшил число ложных тревог с {baseline_fp} до {forest_fp} "
-        f"и обнаружил {forest_tp} аномалий из {forest_tp + forest_fn}. "
-        f"Исходная модель «{winner}» обнаружила {baseline_tp} аномалий. "
-        f"При лимите {TRANSFER_REVIEW_FRACTION:.0%} лес обнаружил {forest_review_tp} "
-        f"аномалий при {forest_review_tp + forest_review_fp} просмотрах, SVM — "
-        f"{svm_review_tp} при {svm_review_tp + svm_review_fp}. Оба режима отбора "
-        "лесом следует подтвердить на следующем станке."
+        f"При жёстком лимите {TRANSFER_REVIEW_FRACTION:.0%} предлагаем случайный лес "
+        "с порогом, который рассчитывается заново по оценкам каждой партии. "
+        f"На M03 он дал {forest_review_tp + forest_review_fp} просмотра при лимите "
+        f"{max_reviews}, обнаружил {forest_review_tp} из {forest_review_tp + forest_review_fn} "
+        f"аномалий и вызвал {forest_review_fp} ложных тревог."
+    )
+    report.p(
+        f"Если допустима более длинная очередь, можно проверить лес с фиксированным "
+        f"порогом {choices[FOREST].threshold:.3f}. На M03 он дал "
+        f"{forest_tp + forest_fp} просмотров при лимите {max_reviews} и обнаружил "
+        f"{forest_tp} из {forest_tp + forest_fn} аномалий. При этом лес дал "
+        f"{forest_fp} ложных тревог. Исходная модель «{winner}» выявила "
+        f"{baseline_tp} аномалий при {baseline_fp} ложных тревогах. "
+        "Оба режима отбора лесом следует подтвердить на следующем станке."
     )
     early_ap = early_test[time_winner].metrics["AP"]
     late_ap = later[time_winner].metrics["AP"]
