@@ -32,7 +32,6 @@ from cnc_data import Recording
 from experiment import (
     BOOST,
     FOREST,
-    TREE,
     TRANSFER_REVIEW_FRACTION,
     Evaluation,
     MachineTransfer,
@@ -71,6 +70,15 @@ def styles() -> dict[str, ParagraphStyle]:
             "Section",
             parent=body,
             fontName="Times-Bold",
+            firstLineIndent=0,
+            spaceAfter=12,
+            keepWithNext=True,
+        ),
+        "appendix": ParagraphStyle(
+            "Appendix",
+            parent=body,
+            fontName="Times-Bold",
+            alignment=TA_CENTER,
             firstLineIndent=0,
             spaceAfter=12,
             keepWithNext=True,
@@ -119,7 +127,7 @@ def styles() -> dict[str, ParagraphStyle]:
 
 class ReportDocument(SimpleDocTemplate):
     def afterFlowable(self, flowable: Any) -> None:
-        if isinstance(flowable, Paragraph) and flowable.style.name == "Section":
+        if isinstance(flowable, Paragraph) and flowable.style.name in {"Section", "Appendix"}:
             self.notify("TOCEntry", (0, flowable.getPlainText(), self.page))
 
 
@@ -167,6 +175,10 @@ class Report:
         self.story: list[Any] = []
         self.image_count = 0
         self.table_count = 0
+        self.appendix_count = 0
+        self.appendix_letter = ""
+        self.appendix_figures = 0
+        self.appendix_tables = 0
 
     def p(self, value: str, style: str = "body") -> None:
         self.story.append(Paragraph(escape(value), self.style[style]))
@@ -175,17 +187,29 @@ class Report:
         self.story.append(PageBreak())
         self.p(title, "section")
 
+    def appendix(self, letter: str, title: str) -> None:
+        self.appendix_count += 1
+        self.appendix_letter = letter
+        self.appendix_figures = 0
+        self.appendix_tables = 0
+        self.story.append(PageBreak())
+        self.p(f"ПРИЛОЖЕНИЕ {letter} — {title}", "appendix")
+
     def figure(self, key: str, reference: str, max_height: float = 125) -> None:
         self.image_count += 1
+        number = str(self.image_count)
+        if self.appendix_letter:
+            self.appendix_figures += 1
+            number = f"{self.appendix_letter}.{self.appendix_figures}"
         path, title, finding = self.figures.items[key]
         img = Image(str(path))
         scale = min(WIDTH / img.imageWidth, max_height * mm / img.imageHeight)
         img.drawWidth, img.drawHeight = img.imageWidth * scale, img.imageHeight * scale
-        caption = Paragraph(escape(f"Рисунок {self.image_count} — {title}"), self.style["caption"])
+        caption = Paragraph(escape(f"Рисунок {number} — {title}"), self.style["caption"])
         self.story.append(
             KeepTogether(
                 [
-                    Paragraph(escape(reference.format(n=self.image_count)), self.style["body"]),
+                    Paragraph(escape(reference.format(n=number)), self.style["body"]),
                     img,
                     caption,
                     Paragraph(escape(finding), self.style["body"]),
@@ -195,10 +219,12 @@ class Report:
 
     def table(self, name: str, rows: list[list[Any]], widths: list[float], reference: str) -> None:
         self.table_count += 1
-        self.p(reference.format(n=self.table_count), "reference")
-        caption = Paragraph(
-            escape(f"Таблица {self.table_count} — {name}"), self.style["table_caption"]
-        )
+        number = str(self.table_count)
+        if self.appendix_letter:
+            self.appendix_tables += 1
+            number = f"{self.appendix_letter}.{self.appendix_tables}"
+        self.p(reference.format(n=number), "reference")
+        caption = Paragraph(escape(f"Таблица {number} — {name}"), self.style["table_caption"])
         self.story.append(caption)
         cells = [[Paragraph(escape(str(v)), self.style["cell"]) for v in row] for row in rows]
         scale = min(mm, WIDTH / sum(widths))
@@ -273,29 +299,6 @@ def test_tables(report: Report, title: str, values: dict[str, Evaluation]) -> No
     )
 
 
-def errors_by_operation(
-    records: list[Recording], indices: np.ndarray, result: Evaluation
-) -> list[list[Any]]:
-    counts: dict[str, Counter[str]] = {}
-    for index, prediction in zip(indices, result.prediction):
-        row = records[index]
-        key = f"{row.machine} / {row.operation}"
-        counts.setdefault(key, Counter())[f"{row.label}{prediction}"] += 1
-    ranked = sorted(
-        counts.items(),
-        key=lambda item: (
-            -item[1]["10"],
-            -item[1]["01"],
-            item[0],
-        ),
-    )
-    return [
-        [key, c["00"] + c["01"], c["01"], c["10"] + c["11"], c["10"]]
-        for key, c in ranked
-        if c["01"] or c["10"]
-    ][:6]
-
-
 def build_report(
     path: Path,
     figures: Figures,
@@ -306,7 +309,7 @@ def build_report(
     standard: dict[str, Evaluation],
     transfer: dict[str, Evaluation],
     scaling: dict[str, tuple[np.ndarray, np.ndarray]],
-    time_indices: tuple[np.ndarray, np.ndarray],
+    time_indices: tuple[np.ndarray, np.ndarray, np.ndarray],
     time_choices: dict[str, Selection],
     early_test: dict[str, Evaluation],
     later: dict[str, Evaluation],
@@ -336,28 +339,12 @@ def build_report(
         "ФРЕЗЕРОВАНИЕ, ВИБРАЦИЯ, УСКОРЕНИЕ, КЛАССИФИКАЦИЯ, " "ДИСБАЛАНС КЛАССОВ, ПЕРЕНОС МОДЕЛИ",
         "keywords",
     )
-    train, test, moved = splits
-    result = standard[winner].metrics
-    target = transfer[winner].metrics
-    transfer_name = machine_transfer.winner
-    transfer_choice = machine_transfer.choices[transfer_name]
-    _, review_fp, review_fn, review_tp = machine_test.matrix.ravel()
-    earlier, control, late = time_indices
-    time_winner = max(time_choices, key=lambda name: time_choices[name].scores.mean())
     report.p(
-        f"Исследованы {len(records)} записей трёхкомпонентного ускорения из набора Bosch. "
-        "Цель работы — распознать аномальный процесс фрезерования по вибрации и проверить "
-        "сохранение качества на другом станке и в более позднем периоде. "
-        "Из каждой записи извлечены 24 признака. "
-        "Сопоставлены семь классификаторов. Выбор по средней точности класса bad на "
-        f"перекрёстной проверке дал модель «{winner}». На обычном тесте AP={result['AP']:.3f} "
-        f"и F1={result['F1']:.3f}. На M03 AP={target['AP']:.3f} и F1={target['F1']:.3f}. "
-        f"На M03 лес с порогом, выбранным на обучении, обнаружил "
-        f"{transfer[FOREST].matrix[1, 1]} аномалий при {transfer[FOREST].matrix[0, 1]} "
-        "ложных тревогах и предложен для дальнейшей проверки. "
-        f"Для проверки переноса во времени модель «{time_winner}» обучили на более "
-        "ранних записях. На данных августа 2021 года модель получила "
-        f"AP {later[time_winner].metrics['AP']:.3f}."
+        f"На {len(records)} записях вибрации Bosch CNC Machining сопоставлены семь моделей "
+        "для обнаружения аномалий фрезерования. Качество проверено на новых записях "
+        "знакомых станков, на отложенном станке M03 и на данных августа 2021 года. "
+        "Для ручного отбора записей оценён лимит просмотра 5 % партии. "
+        "При переносе рабочие характеристики зависели от модели и правила отбора."
     )
     report.story.append(PageBreak())
     report.p("СОДЕРЖАНИЕ", "center")
@@ -365,44 +352,34 @@ def build_report(
     toc.levelStyles = [report.style["toc"]]
     report.story.append(toc)
 
+    train, test, moved = splits
+    earlier, control, late = time_indices
+    time_winner = max(time_choices, key=lambda name: time_choices[name].scores.mean())
+    transfer_name = machine_transfer.winner
+    _, transfer_fp, transfer_fn, transfer_tp = machine_test.matrix.ravel()
+
     report.section("ВВЕДЕНИЕ")
     report.p(
-        "Во время обработки детали фреза, шпиндель и корпус станка вибрируют. "
-        "Установленный на станке датчик записывает, как меняется ускорение по трём осям. "
-        "Если обработка идёт аномально, могут появиться более сильные колебания, "
-        "отдельные всплески или новые частоты. При этом и исправный станок может "
-        "вибрировать по-разному при смене инструмента или операции. По одному "
-        "высокому пику поэтому трудно решить, действительно ли произошла аномалия."
-    )
-    report.p(
-        "Задача состоит в том, чтобы по целой записи вибрации отнести один цикл обработки "
-        "к нормальному (good) или аномальному (bad). Модель получает примеры обоих режимов "
-        "и учится выставлять каждой записи оценку аномальности. При превышении рабочего "
-        "порога запись помечается для проверки. Пропуск оставляет аномальную обработку "
-        "без внимания, а ложная тревога требует проверки исправного процесса."
-    )
-    report.p(
-        "В работе проверяются два вопроса. Во-первых, какие методы лучше распознают "
-        "редкие аномалии в новых записях со знакомых станков. Во-вторых, сохраняется ли "
-        "это качество на новом станке и в более позднем периоде. "
-        "Для этого сравниваются семь методов и измеряются как способность ставить "
-        "аномалии выше в списке подозрительных записей, так и ошибки при выбранном пороге."
+        "По вибрации станка можно обнаруживать отклонения при фрезеровании. "
+        "Однако колебания зависят также от станка и операции. В работе проверяем, "
+        "сохраняется ли качество распознавания при смене станка и со временем. "
+        "Для ручной проверки считаем, сколько записей придётся просмотреть и "
+        "сколько аномалий останется вне отбора."
     )
 
-    report.section("1 Данные и план эксперимента")
+    report.section("1 Данные и схема проверки")
+    bad_total = sum(record.label for record in records)
     report.p(
-        "Набор Bosch CNC Machining [1, 2] содержит записи датчика Bosch CISS по осям X, Y "
-        "и Z с частотой 2000 Гц. Каталог good обозначает нормальный процесс, каталог bad — "
-        "аномальный. За объект взят целый HDF5-файл. Единица исходных отсчётов в описании "
-        "формата не указана, поэтому амплитуда приведена в единицах файла."
-    )
-    report.figure(
-        "classes", "Распределение записей по классам показано на рисунке {n}.", max_height=55
+        f"Набор Bosch CNC Machining [1, 2] содержит {len(records)} записей с датчика "
+        f"ускорения по трём осям, из них {bad_total} аномальных ({bad_total / len(records):.1%}). "
+        "Одна запись соответствует одному файлу HDF5. Метки good и bad обозначают "
+        "нормальный и аномальный процессы. Частота измерений 2000 Гц. Амплитуды показаны "
+        "в единицах исходного файла."
     )
     report.figure(
         "signal",
         "Фрагменты ускорения для двух классов сопоставлены на рисунке {n}.",
-        max_height=99,
+        max_height=85,
     )
     rows = [["Часть", "Станки", "Файлы", "good", "bad", "Доля bad"]]
     for label, machines, indices in [
@@ -421,177 +398,24 @@ def build_report(
         "Число файлов в каждой части приведено в таблице {n}.",
     )
     report.p(
-        "Обычный тест отвечает на вопрос, как модель работает на новых записях "
-        "с уже знакомых станков. Для него отложены 25 % файлов M01 и M02 "
-        "с сохранением пропорции классов. Проверка переноса отвечает на другой вопрос: "
-        "можно ли применить ту же модель на M03. Все его записи отложены целиком "
-        "по схеме проверки по станкам, предложенной авторами набора [1]. В обоих "
-        "тестах использованы одни и те же модели и пороги. Результат на M03 отражает "
-        "смену и станка, и состава операций. Дополнительно проверен перенос во времени "
-        "на тех же двух станках M01 и M02. Для него модели, параметры и пороги "
-        "заново подбирались только по записям до августа 2021 года."
-    )
-    known_operations = {records[i].operation for i in train}
-    known_periods = {records[i].period for i in train}
-    moved_operations = {records[i].operation for i in moved}
-    moved_periods = {records[i].period for i in moved}
-    report.p(
-        f"Из {len(moved_operations)} операций M03 в обучении встречаются "
-        f"{len(moved_operations & known_operations)}, из {len(moved_periods)} периодов — "
-        f"{len(moved_periods & known_periods)}. Поэтому перенос на M03 и проверка "
-        "на целиком отложенном августе отвечают на разные вопросы."
+        "Для обычного теста отложили 25 % записей M01 и M02 с сохранением доли классов. "
+        "Те же модели и пороги проверили на всех записях M03. Для проверки переноса "
+        "во времени отдельно выделили записи августа 2021 года и более ранний контрольный тест."
     )
     report.p(
-        "Одна запись может содержать десятки тысяч отсчётов. Для сравнения файлов "
-        "одинаковым способом каждую ось описывают восемь чисел. Среднеквадратическое "
-        "значение (СКЗ) характеризует общий уровень ускорения, стандартное отклонение — "
-        "колебания вокруг среднего, размах — разницу между наибольшим и наименьшим "
-        "отсчётами. Эксцесс помогает заметить редкие сильные отклонения. Ещё четыре "
-        "числа показывают, сколько энергии колебаний приходится на разные частоты."
-    )
-    report.p(
-        "Для воспроизведения расчёта эксцесс определён как четвёртый стандартизованный "
-        "момент за вычетом трёх. Энергии рассчитаны по односторонней спектральной "
-        "плотности в полосах 0–100, 100–300, 300–600 и 600–1000 Гц. Использован метод "
-        "Уэлча [3] с окном Ханна до 1024 отсчётов, перекрытием 50 % и удалением среднего "
-        "в каждом сегменте. Сумма спектральной плотности в полосе умножается на шаг "
-        "частоты. Энергия выражена в квадрате исходной единицы ускорения."
-    )
-    report.p(
-        "Все 24 признака рассчитываются отдельно для каждого файла. Номер станка, "
-        "операция и период нужны для разбиения и разбора ошибок. Вход модели состоит "
-        "из характеристик ускорения. Для трёх методов, чувствительных к масштабу "
-        "признаков, значения стандартизируются. Параметры стандартизации и медианы "
-        "для заполнения пропусков рассчитываются только на обучающей части "
-        "соответствующего разбиения."
+        "Модели получают 24 признака ускорения из каждого файла. "
+        "Расчёт признаков описан в приложении А."
     )
 
-    report.section("2 Модели, параметры и рабочий порог")
+    report.section("2 Выбор модели и результаты тестов")
     report.p(
-        "За точку отсчёта взят DummyClassifier, который объявляет все записи "
-        "нормальными. Логистическая регрессия складывает взвешенные признаки, "
-        "метод ближайших соседей (kNN) опирается на похожие примеры, а метод "
-        "опорных векторов (SVM) строит нелинейную границу между классами. Для SVM "
-        "использованы радиальное ядро и сигмоидальная калибровка оценок. "
-        "На каждом из трёх внутренних разбиений калибровки медианы и масштабы "
-        "оцениваются только по файлам, на которых обучается SVM."
-    )
-    report.p(
-        "Решающее дерево задаёт последовательность вопросов о признаках. Случайный "
-        "лес объединяет ответы деревьев, обученных на разных подвыборках. "
-        "Градиентный бустинг строит деревья последовательно, чтобы каждое уточняло "
-        "оценки предыдущих. В работе использован HistGradientBoostingClassifier из "
-        "scikit-learn [4]. Он позволяет ограничить сложность каждого дерева "
-        "и проследить, как меняется качество после каждой итерации."
-    )
-    report.p(
-        "Аномалий мало, поэтому даже постоянный ответ good даёт высокую долю верных "
-        "ответов. Для выбора модели используется средняя точность (AP). Она "
-        "характеризует, насколько хорошо модель поднимает реальные аномалии в начало "
-        "списка подозрительных записей. В итоговых таблицах также приведена площадь "
-        "под кривой точность–полнота (PR-AUC), вычисленная методом трапеций."
-    )
-    report.p(
-        "Каждый набор параметров проверяется на пяти разбиениях обучающих файлов "
-        "с сохранением доли аномалий. На каждом разбиении модель учится на четырёх "
-        "частях и оценивается на пятой. GridSearchCV перебирает сочетания из таблицы. "
-        "Выбирается вариант с наибольшей средней AP. Начальное состояние генератора равно 42."
-    )
-    rows = [["Модель", "Сетка параметров", "Выбранные параметры", "AP, среднее ± СКО", "Порог"]]
-    for name, candidate in candidates().items():
-        choice = choices[name]
-        rows.append(
-            [
-                name,
-                parameters(candidate.grid),
-                parameters(choice.params),
-                f"{choice.scores.mean():.3f} ± {choice.scores.std():.3f}",
-                f"{choice.threshold:.4g}",
-            ]
-        )
-    report.table(
-        "Подбор параметров на обучающих файлах",
-        rows,
-        [25, 51, 50, 27, 17],
-        "Сетки поиска и выбранные параметры приведены в таблице {n}.",
-    )
-    report.figure("cv", "Средние значения AP и разброс по разбиениям показаны на рисунке {n}.")
-    report.figure("grid", "Оценки SVM для разных сочетаний параметров приведены на рисунке {n}.")
-    report.p(
-        "При снижении порога модель обычно обнаруживает больше аномалий и чаще "
-        "подаёт ложные тревоги. Полнота (recall) показывает, какую долю аномалий "
-        "обнаружили, а точность (precision) — какая доля тревог была обоснованной. "
-        "Для выбора порога использован максимум F1. Эта метрика учитывает обе "
-        "величины и падает, если одна из них мала."
-    )
-    report.p(
-        f"Для модели «{winner}» этот максимум получен при пороге "
-        f"{choices[winner].threshold:.3f} на оценках проверочных частей обучения. "
-        "При равном F1 выбран больший порог, при котором тревог будет столько же "
-        "или меньше. Для M03 применён тот же порог."
-    )
-    report.figure("threshold", "Зависимость метрик от порога показана на рисунке {n}.")
-
-    report.section("3 Эксперименты с деревьями")
-    report.p(
-        "Для дерева по очереди изменены максимальная глубина и минимальное число "
-        "объектов в листе. Для первой кривой разрешён лист из одной записи. "
-        "Для второй глубина не ограничена. Ошибка равна единице "
-        "минус сбалансированная доля верных ответов. Для ансамблей использована "
-        "ранговая ошибка 1 − AP."
-    )
-    report.figure("tree", "Ошибки обучения и проверки дерева сопоставлены на рисунке {n}.")
-    for name in (TREE, FOREST):
-        raw, scaled = scaling[name]
-        report.p(
-            f"Для модели «{name}» средняя AP без стандартизации {raw.mean():.4f}, "
-            f"со стандартизацией {scaled.mean():.4f}. "
-            f"Изменение {scaled.mean() - raw.mean():+.4f}. "
-            "В итоговой модели использованы исходные масштабы признаков."
-        )
-    max_change = max(abs(scaled.mean() - raw.mean()) for raw, scaled in scaling.values())
-    if max_change < 0.00005:
-        report.p(
-            "В этом эксперименте стандартизация дерева и леса не изменила среднюю AP "
-            "с точностью до четырёх знаков после запятой."
-        )
-    report.p(
-        "У леса проверено, насколько усреднение большого числа деревьев снижает "
-        "ошибку и зависимость результата от случайного состояния. Для бустинга "
-        "сравниваются две скорости обучения. Меньший шаг меняет оценку медленнее, "
-        "поэтому важно смотреть, какой результат достигается при разном числе деревьев."
-    )
-    report.figure("forest_count", "Зависимость ошибки от числа деревьев показана на рисунке {n}.")
-    report.figure("forest_parameters", "Влияние параметров леса на AP показано на рисунке {n}.")
-    report.figure(
-        "boost_iterations", "Изменение ошибки бустинга по итерациям показано на рисунке {n}."
-    )
-    report.figure("boost_parameters", "Влияние параметров бустинга на AP показано на рисунке {n}.")
-
-    report.section("4 Итоговая проверка и перенос")
-    report.p(
-        "После выбора моделей и порогов проведены итоговые проверки. В таблицах "
-        "доля верных ответов учитывает все файлы, а сбалансированная доля даёт "
-        "одинаковый вес нормальному и аномальному классам. Матрицы ошибок показывают, "
-        "сколько записей каждого класса распознано верно, сколько аномалий пропущено "
-        "и сколько нормальных записей вызвало тревогу."
-    )
-    report.p(
-        "ROC показывает, как растёт доля обнаруженных аномалий при увеличении доли "
-        "ложных тревог среди нормальных файлов. Кривая точность–полнота показывает, "
-        "какая доля тревог остаётся обоснованной при том же охвате аномалий. Обе "
-        "кривые построены по вероятностям класса bad при изменении порога. Для Dummy "
-        "оценка всех файлов одинакова, поэтому AP равна доле аномалий. Трапецеидальная "
-        "PR-AUC для этой модели выше AP из-за отрезка до условной точки нулевой полноты."
-    )
-    test_tables(report, "Обычный тест", standard)
-    test_tables(report, "Перенос на M03", transfer)
-    report.figure("roc_pr", "Кривые ROC и точность–полнота приведены на рисунке {n}.")
-    report.figure(
-        "matrix", "Нормированные матрицы ошибок выбранной модели показаны на рисунке {n}."
-    )
-    report.figure(
-        "transfer", "Значения AP обычного теста и переноса на M03 сопоставлены на рисунке {n}."
+        "Сопоставили семь классификаторов. DummyClassifier всегда предсказывает "
+        "нормальную работу. Для выбора параметров перебрали сетки на пяти стратифицированных "
+        "разбиениях обучения. Критерий выбора — средняя AP, которая показывает, насколько "
+        "высоко модель ставит аномалии в списке подозрительных записей. Порог выбирали "
+        "по максимуму F1 на проверочных частях обучения. Настройки предобработки "
+        "вычислялись внутри разбиений, включая калибровку SVM. Графики подбора "
+        "приведены в приложении А, полные метрики и матрицы ошибок — в приложении Б."
     )
     summary = [
         [
@@ -623,35 +447,208 @@ def build_report(
         [23, 52, 23, 18, 18, 18, 18],
         "Параметры моделей и результаты обоих тестов собраны в таблице {n}.",
     )
-    report.p(
-        f"Доли аномалий составляют {sum(records[i].label for i in test) / len(test):.1%} "
-        f"в обычном тесте и {sum(records[i].label for i in moved) / len(moved):.1%} "
-        "на M03. Эти доли задают разные уровни AP случайного ранжирования. При "
-        "сопоставлении AP и F1 также следует учитывать малое число аномальных файлов."
+    report.figure(
+        "transfer",
+        "Сравнение обычного теста с переносом на M03 показано на рисунке {n}.",
+        max_height=53,
     )
 
-    report.section("5 Отбор записей для проверки на новом станке")
+    report.section("3 Отбор записей на станке M03")
+    max_reviews = int(len(moved) * TRANSFER_REVIEW_FRACTION)
     report.p(
-        "На новом станке прежний порог SVM даёт слишком много тревог для ручной проверки. "
-        "Вместо автоматического решения об остановке станка рассмотрен отбор записей "
-        "для просмотра человеком. В этом эксперименте допустим просмотр до "
-        f"{TRANSFER_REVIEW_FRACTION:.0%} файлов каждой партии. Такой лимит задаёт нагрузку "
-        "на проверяющего. Цена пропуска аномалии в исходных данных не указана."
+        f"В эксперименте все {len(moved)} записей M03 образуют одну партию. "
+        f"Лимит {TRANSFER_REVIEW_FRACTION:.0%} допускает {max_reviews} просмотров. "
+        "В очередь попадают записи с наибольшими оценками. При совпадении оценок "
+        "на границе отбора вся группа остаётся вне очереди. Для применения на станке "
+        "размер партии предстоит определить, например по сменам."
+    )
+    rows = [["Модель и правило отбора", "Просмотры", "Найдено", "Пропущено", "Ложные тревоги"]]
+    for name, evaluation in (
+        (f"{winner}, порог из обучения", transfer[winner]),
+        ("Лес, фиксированный порог", transfer[FOREST]),
+        ("kNN, фиксированный порог", transfer["kNN"]),
+        ("Лес, лимит 5 %", limited_review[FOREST]),
+        ("Бустинг, лимит 5 %", limited_review[BOOST]),
+    ):
+        _, fp, fn, tp = evaluation.matrix.ravel()
+        rows.append([name, tp + fp, tp, fn, fp])
+    report.table(
+        "Нагрузка ручной проверки и ошибки на M03",
+        rows,
+        [57, 25, 23, 27, 33],
+        "Основные варианты отбора сопоставлены в таблице {n}.",
+    )
+    _, svm_fp, _, svm_tp = transfer[winner].matrix.ravel()
+    normal_mask = np.array([records[i].label == 0 for i in moved])
+    median = np.median(transfer[winner].scores[normal_mask])
+    report.p(
+        f"На M03 медианная оценка SVM для нормальных записей составила {median:.3f} "
+        f"при пороге {choices[winner].threshold:.3f}. Сдвиг оценок проявился "
+        "сразу в нескольких операциях и привёл к большому числу тревог. "
+        "По данным этого эксперимента установить физическую причину сдвига нельзя."
     )
     report.p(
-        f"Это пакетная проверка. Одна партия включает все {len(moved)} записей M03. "
-        "Лимит округляется вниз до целого числа записей. При 19 записях он равен нулю, "
-        "при 20 допускается один просмотр. Для работы на станке ещё предстоит выбрать "
-        "размер партии, например по длительности смены или по числу накопленных файлов."
+        "Полное сравнение при лимите, отдельный подбор по взаимному переносу M01 и M02 "
+        "и пропуски по операциям приведены в приложении В."
+    )
+
+    report.section("4 Перенос во времени")
+    late_by_machine = Counter(records[i].machine for i in late if records[i].label)
+    late_bad = sum(late_by_machine.values())
+    report.p(
+        f"Из ранних записей M01 и M02 для обучения взяли {len(earlier)}, для контроля — "
+        f"{len(control)}. Августовский тест содержит {len(late)} записей. "
+        "Для обеих проверок использованы одни и те же обученные модели и пороги."
+    )
+    report.figure(
+        "time_transfer",
+        "AP на раннем и августовском тестах сопоставлены на рисунке {n}.",
+        max_height=85,
+    )
+    _, time_fp, _, time_tp = later[time_winner].matrix.ravel()
+    _, forest_time_fp, _, forest_time_tp = later[FOREST].matrix.ravel()
+    report.p(
+        f"По ранним разбиениям выбрали модель «{time_winner}». В августе она обнаружила "
+        f"{time_tp} из {late_bad} аномалий, ложных тревог — {time_fp}. Лес обнаружил "
+        f"{forest_time_tp} из {late_bad}, ложных тревог — {forest_time_fp}. "
+        f"На M01 приходится {late_by_machine['M01']} аномалий, на M02 — "
+        f"{late_by_machine['M02']}. Сравнение стоит повторить на следующем периоде "
+        "с результатами отдельно по каждому станку. Полная сводка дана в приложении В."
+    )
+
+    report.section("ЗАКЛЮЧЕНИЕ")
+    ordinary_ap = choices[winner].scores.mean()
+    forest_ap = choices[FOREST].scores.mean()
+    report.p(
+        f"Для знакомых станков выбрана {winner}. Она получила наибольшую среднюю AP "
+        f"на пяти разбиениях обучающих записей M01 и M02 ({ordinary_ap:.3f} против "
+        f"{forest_ap:.3f} у случайного леса). На обычном тесте её AP составила "
+        f"{standard[winner].metrics['AP']:.3f}. На отложенном M03 AP снизилась до "
+        f"{transfer[winner].metrics['AP']:.3f}. Из {svm_tp + svm_fp} тревог "
+        f"обоснованными оказались {svm_tp} ({transfer[winner].metrics['Precision']:.1%}). "
+        "Поэтому для ручного отбора на новом станке прежний порог SVM непрактичен."
+    )
+    _, forest_fp, forest_fn, forest_tp = limited_review[FOREST].matrix.ravel()
+    _, boost_fp, _, boost_tp = limited_review[BOOST].matrix.ravel()
+    _, fixed_fp, _, fixed_tp = transfer[FOREST].matrix.ravel()
+    report.p(
+        "При жёстком лимите 5 % для следующей проверки предлагаем случайный лес "
+        f"с порогом по оценкам каждой партии. На M03 он нашёл {forest_tp} из "
+        f"{forest_tp + forest_fn} аномалий за {forest_tp + forest_fp} просмотра. "
+        f"Бустинг нашёл {boost_tp} аномалий за {boost_tp + boost_fp} просмотров. "
+        f"Фиксированный порог леса {choices[FOREST].threshold:.3f} позволил найти "
+        f"{fixed_tp} аномалий, но потребовал {fixed_tp + fixed_fp} просмотров при "
+        f"лимите {max_reviews}. Рекомендация основана на сравнении на M03 и требует "
+        "проверки на другом станке."
+    )
+
+    report.section("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ")
+    report.p(
+        "1 Тнани М.-А., Файль М., Дипольд К. Система сбора данных для фрезерных "
+        "станков с ЧПУ. Procedia CIRP. 2022. Т. 107. С. 131–136. "
+        "DOI 10.1016/j.procir.2022.04.022."
     )
     report.p(
-        "Для выбора модели использованы только обучающие файлы M01 и M02. "
-        "Каждый станок по очереди целиком откладывался. Параметры каждой модели "
-        "выбраны по средней AP двух проверок. Затем на каждом отложенном станке "
-        "оставили до 5 % записей с наибольшими оценками и посчитали долю найденных "
-        "аномалий. При одинаковой оценке на границе вся группа остаётся вне отбора. "
-        "Итоговую модель выбрали по средней полноте двух проверок, при равенстве "
-        "использовали AP."
+        "2 Bosch CNC Machining Dataset. UCI Machine Learning Repository. 2022. "
+        "URL https://archive.ics.uci.edu/dataset/752/bosch+cnc+machining+dataset. "
+        "Файлы и описание: https://github.com/boschresearch/CNC_Machining. CC BY 4.0."
+    )
+    report.p(
+        "3 SciPy. Документация метода Уэлча. "
+        "URL https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.welch.html."
+    )
+    report.p(
+        "4 Scikit-learn. Документация HistGradientBoostingClassifier и метрики AP. "
+        "URL https://scikit-learn.org/stable/modules/ensemble.html."
+    )
+    report.p(
+        "5 ГОСТ 7.32-2017. Отчёт о научно-исследовательской работе. Структура и правила "
+        "оформления. Москва, Стандартинформ, 2017."
+    )
+    report.appendix("А", "Подбор и диагностика моделей")
+    report.p(
+        "На каждой оси рассчитаны среднеквадратическое значение, стандартное отклонение, "
+        "размах, эксцесс и энергии в четырёх полосах. Эксцесс — четвёртый "
+        "стандартизованный момент за вычетом трёх. "
+        "Энергии вычислены по методу Уэлча [3] в полосах 0–100, 100–300, 300–600 "
+        "и 600–1000 Гц. Использовано окно Ханна до 1024 отсчётов с перекрытием 50 % "
+        "и удалением среднего в каждом сегменте. Пропуски заполнялись медианой "
+        "обучающей части. Для логистической регрессии, kNN и SVM применялась стандартизация."
+    )
+    report.p(
+        "Для анализа бустинга использован HistGradientBoostingClassifier из "
+        "scikit-learn [4]. Он позволяет ограничить сложность дерева и оценить "
+        "качество после каждой итерации. Для SVM применялась сигмоидальная калибровка."
+    )
+    rows = [["Модель", "Сетка параметров", "Выбранные параметры", "AP, среднее ± СКО", "Порог"]]
+    for name, candidate in candidates().items():
+        choice = choices[name]
+        rows.append(
+            [
+                name,
+                parameters(candidate.grid),
+                parameters(choice.params),
+                f"{choice.scores.mean():.3f} ± {choice.scores.std():.3f}",
+                f"{choice.threshold:.4g}",
+            ]
+        )
+    report.table(
+        "Подбор параметров на обучающих файлах",
+        rows,
+        [25, 51, 50, 27, 17],
+        "Сетки поиска и выбранные параметры приведены в таблице {n}.",
+    )
+    for key, reference in (
+        ("cv", "Средняя AP и разброс по разбиениям показаны на рисунке {n}."),
+        ("grid", "Результат сеточного поиска SVM показан на рисунке {n}."),
+        ("threshold", "Зависимость метрик от порога показана на рисунке {n}."),
+    ):
+        report.figure(key, reference, max_height=67)
+    report.p(
+        "Для дерева по очереди менялись максимальная глубина и минимальное число "
+        "записей в листе. Ошибка равна единице минус сбалансированная доля верных ответов. "
+        "Для ансамблей использована ошибка 1 − AP."
+    )
+    for key, reference, height in (
+        ("tree", "Ошибки обучения и проверки дерева сопоставлены на рисунке {n}.", 64),
+        ("forest_count", "Влияние числа деревьев показано на рисунке {n}.", 64),
+        ("forest_parameters", "Влияние параметров леса показано на рисунке {n}.", 64),
+        ("boost_iterations", "Ошибка бустинга по итерациям показана на рисунке {n}.", 51),
+        ("boost_parameters", "Влияние параметров бустинга показано на рисунке {n}.", 51),
+    ):
+        report.figure(key, reference, max_height=height)
+    scale_notes = [
+        f"{name} — {raw.mean():.4f} без неё и {scaled.mean():.4f} с ней"
+        for name, (raw, scaled) in scaling.items()
+    ]
+    report.p("Средняя AP при проверке стандартизации (" + ", ".join(scale_notes) + ").")
+
+    report.appendix("Б", "Метрики, матрицы ошибок и важность признаков")
+    report.p(
+        "Точность показывает долю обоснованных тревог, полнота — долю найденных "
+        "аномалий. F1 учитывает обе величины. PR-AUC рассчитана методом трапеций. "
+        "Для Dummy оценки постоянны, поэтому AP совпадает с долей аномалий, а "
+        "трапецеидальная PR-AUC выше из-за отрезка до точки нулевой полноты."
+    )
+    report.figure(
+        "roc_pr", "ROC и кривые точность–полнота приведены на рисунке {n}.", max_height=90
+    )
+    report.figure(
+        "matrix", "Нормированные матрицы ошибок SVM приведены на рисунке {n}.", max_height=66
+    )
+    test_tables(report, "Обычный тест", standard)
+    test_tables(report, "Перенос на M03", transfer)
+    test_tables(report, "Август 2021 года", later)
+    report.figure(
+        "importance", "Перестановочная важность для SVM показана на рисунке {n}.", max_height=52
+    )
+
+    report.appendix("В", "Дополнительные результаты переноса")
+    report.p(
+        "При отдельном подборе модели для ручного просмотра использованы только "
+        "обучающие записи M01 и M02. Каждый из станков по очереди откладывали. Параметры "
+        "выбирали по средней AP, модели — по средней полноте при лимите просмотра 5 %. "
+        "При равной полноте решение принимали по AP."
     )
     rows = [["Модель", "Средняя AP", "Полнота M01", "Полнота M02", "Средняя полнота"]]
     for name, checks in machine_transfer.validation.items():
@@ -672,15 +669,10 @@ def build_report(
         "Результаты взаимной проверки станков приведены в таблице {n}.",
     )
     report.p(
-        f"Выбрана модель «{transfer_name}» с параметрами {parameters(transfer_choice.params)}. "
-        "После выбора её обучили на всей обучающей части M01 и M02. На M03 граница "
-        "отбора определяется только оценками файлов партии и заранее заданным лимитом. "
-        "Метки M03 использованы для подсчёта ошибок."
-    )
-    report.p(
-        "На партии M03 одинаковый лимит применили к оценкам всех семи моделей. "
-        "Отдельно показана логистическая регрессия с параметрами, выбранными по "
-        "взаимному переносу M01 и M02, и три варианта с порогами из обучения."
+        f"В этой проверке выбрана модель «{transfer_name}» "
+        f"({parameters(machine_transfer.choices[transfer_name].params)}). На M03 "
+        f"она нашла {transfer_tp} из {transfer_tp + transfer_fn} аномалий и дала "
+        f"{transfer_fp} ложных тревог."
     )
     rows = [
         [
@@ -726,64 +718,34 @@ def build_report(
         "transfer_review_models и transfer_review. Если оценки совпадают на границе, "
         "модель может использовать лишь часть лимита. Прочерк означает, что отбор пуст."
     )
-    _, forest_review_fp, forest_review_fn, forest_review_tp = limited_review[FOREST].matrix.ravel()
-    _, boost_review_fp, _, boost_review_tp = limited_review[BOOST].matrix.ravel()
-    _, svm_review_fp, _, svm_review_tp = limited_review[winner].matrix.ravel()
-    max_reviews = int(len(moved) * TRANSFER_REVIEW_FRACTION)
-    report.p(
-        f"Лимит на M03 составляет {max_reviews} из {len(moved)} записей. При одном "
-        f"лимите лес нашёл {forest_review_tp} из {forest_review_tp + forest_review_fn} "
-        f"аномалий за {forest_review_tp + forest_review_fp} просмотра. "
-        f"Бустинг нашёл {boost_review_tp} аномалий при {boost_review_tp + boost_review_fp} "
-        f"просмотрах. У леса было {forest_review_fp} ложных тревог, у бустинга — "
-        f"{boost_review_fp}. SVM нашла {svm_review_tp} аномалий при "
-        f"{svm_review_tp + svm_review_fp} просмотрах. "
-        "Сравнение при общем лимите выполнено после изучения результатов M03."
-    )
-    report.p(
-        f"Лимит сократил очередь ручной проверки до {review_tp + review_fp} из {len(moved)} "
-        f"файлов, но модель «{transfer_name}» пропустила {review_fn} аномалий. "
-        "Ограничение числа просмотров само по себе даёт мало пользы, если в начало "
-        "очереди попадает слишком мало аномальных записей."
-    )
-    _, forest_fp, forest_fn, forest_tp = transfer[FOREST].matrix.ravel()
-    _, knn_fp, knn_fn, knn_tp = transfer["kNN"].matrix.ravel()
-    report.p(
-        f"Если важнее сохранить полноту обнаружения, для следующей проверки предлагаем "
-        f"случайный лес с порогом {choices[FOREST].threshold:.3f}. На M03 он "
-        f"направил на просмотр {forest_tp + forest_fp} записей, нашёл {forest_tp} из "
-        f"{forest_tp + forest_fn} аномалий и дал {forest_fp} ложных тревог. "
-        f"Если ручная проверка ограничена, вариант kNN даёт {knn_fp} ложных тревог, "
-        f"но пропускает {knn_fn} аномалии. По сравнению с kNN лес обнаружил "
-        f"ещё {forest_tp - knn_tp} аномалии ценой {forest_fp - knn_fp} дополнительных "
-        "ложных тревог. Выбор зависит от того, сколько стоит пропуск и сколько "
-        "записей успевает проверить оператор."
-    )
-    report.p(
-        "Пороги леса и kNN получены на обучающих файлах. Само предложение использовать "
-        "лес сделано после сравнения результатов на M03. Следующий шаг — зафиксировать "
-        "лес и его порог и проверить число пропусков и ложных тревог на следующем "
-        "станке. Здесь в тесте M03 всего девять аномалий."
-    )
-
-    report.section("6 Перенос на август 2021 года")
-    late_by_machine = Counter(records[i].machine for i in late if records[i].label)
-    late_bad = sum(late_by_machine.values())
-    report.p(
-        f"Из записей M01 и M02 до августа 2021 года выделили ранний тест "
-        f"из {len(control)} записей, из них {sum(records[i].label for i in control)} "
-        f"аномальных. Остальные {len(earlier)} ранних файлов использовали для обучения "
-        "и подбора параметров и порогов. В августовский тест вошли все "
-        f"{len(late)} записей этих двух станков, из них {late_bad} аномальных."
-    )
-    report.p(
-        f"По средней AP на обучении выбрали модель «{time_winner}». В обоих тестах "
-        "для каждого метода использовали один и тот же обученный классификатор и порог. "
-        "Разность AP рассчитана как AP августа за вычетом AP раннего теста."
-    )
-    report.figure(
-        "time_transfer", "Значения AP раннего и августовского тестов сопоставлены на рисунке {n}."
-    )
+    anomaly_indices = [i for i in moved if records[i].label == 1]
+    misses = {
+        name: {
+            i
+            for i, predicted in zip(moved, transfer[name].prediction)
+            if records[i].label == 1 and predicted == 0
+        }
+        for name in (FOREST, "kNN")
+    }
+    operations = sorted({records[i].operation for i in misses[FOREST] | misses["kNN"]})
+    if operations:
+        rows = [["Операция", "Аномалии", "Пропуски леса", "Пропуски kNN"]]
+        for operation in operations:
+            files = {i for i in anomaly_indices if records[i].operation == operation}
+            rows.append(
+                [
+                    operation,
+                    len(files),
+                    len(files & misses[FOREST]),
+                    len(files & misses["kNN"]),
+                ]
+            )
+        report.table(
+            "Пропуски случайного леса и kNN по операциям на M03",
+            rows,
+            [38, 38, 47, 47],
+            "Операции с пропущенными аномалиями приведены в таблице {n}.",
+        )
     time_rows = [
         [
             "Модель",
@@ -820,175 +782,8 @@ def build_report(
         [18, 36, 14, 21, 14, 16, 14, 14, 18],
         "Последний столбец таблицы {n} показывает разность AP двух тестов.",
     )
-    for name in dict.fromkeys((time_winner, "SVM", FOREST)):
-        _, false_alarms, missed, detected = later[name].matrix.ravel()
-        report.p(
-            f"В августе модель «{name}» обнаружила {detected} из {detected + missed} "
-            f"аномалий. Число ложных тревог — {false_alarms}."
-        )
-
-    _, later_forest_fp, later_forest_fn, later_forest_tp = later[FOREST].matrix.ravel()
-    report.p(
-        f"Для следующего периода стоит зафиксировать лес, обученный на ранних файлах, "
-        f"и его порог {time_choices[FOREST].threshold:.3f}. В августе он обнаружил "
-        f"{later_forest_tp} из {late_bad} аномалий при {later_forest_fp} ложных тревогах. "
-        f"Из {late_bad} аномалий {late_by_machine['M01']} относятся к M01 и "
-        f"{late_by_machine['M02']} — к M02. При следующей проверке нужно считать пропуски "
-        "и ложные тревоги отдельно для каждого станка."
-    )
-    test_tables(report, "Август 2021 года", later)
-
-    report.section("7 Интерпретация и инженерный разбор")
-    report.p(
-        "Чтобы понять, на какие измерения опирается выбранная модель, один признак "
-        "перемешивали между файлами, сохраняя остальные. Если AP падает, модель "
-        "пользовалась информацией этого признака. Связанные признаки могут частично "
-        "заменять друг друга. Отрезки на графике показывают стандартное отклонение "
-        "по пяти проверочным частям и 12 повторениям."
-    )
-    report.figure("importance", "Результаты перестановки признаков показаны на рисунке {n}.")
-    for title, indices, evaluation in [
-        ("Обычный тест", test, standard[winner]),
-        ("Перенос на M03", moved, transfer[winner]),
-    ]:
-        tn, fp, fn, tp = evaluation.matrix.ravel()
-        report.p(
-            f"{title}. Модель «{winner}» пропустила {fn} из {fn + tp} аномалий, а "
-            f"{fp} из {tn + fp} нормальных записей вызвали ложную тревогу."
-        )
-        rows = errors_by_operation(records, indices, evaluation)
-        if rows:
-            report.table(
-                f"{title}. Операции с ошибками модели «{winner}»",
-                [["Станок / операция", "good", "Ложные тревоги", "bad", "Пропуски"], *rows],
-                [48, 24, 36, 24, 36],
-                f"Ошибки по операциям для выборки «{title}» приведены в таблице {{n}}.",
-            )
-        if title == "Перенос на M03" and fp:
-            examples = sorted((row for row in rows if row[2]), key=lambda row: -row[2])[:2]
-            details = ", ".join(
-                f"{key.split(' / ')[-1]} — {fp} из {good}" for key, good, fp, _, _ in examples
-            )
-            labels = np.array([records[i].label for i in indices])
-            median = np.median(evaluation.scores[labels == 0])
-            report.p(
-                f"Ложные тревоги возникали в нескольких операциях ({details} нормальных "
-                f"записей). Медианная оценка нормальных файлов M03 составила {median:.3f} "
-                f"при рабочем пороге {choices[winner].threshold:.3f}."
-            )
-    ordinary_tn, ordinary_fp, _, _ = standard[winner].matrix.ravel()
-    moved_tn, moved_fp, _, _ = transfer[winner].matrix.ravel()
-    report.p(
-        f"Среди нормальных записей доля ложных тревог изменилась с "
-        f"{ordinary_fp / (ordinary_tn + ordinary_fp):.1%} в обычном тесте "
-        f"до {moved_fp / (moved_tn + moved_fp):.1%} на M03. На новом станке "
-        "штатные записи часто получают высокую оценку аномальности. "
-        "Различия в фоне вибрации и составе операций могут объяснять этот результат. "
-        "Метки показывают состояние процесса и не позволяют установить конкретную "
-        "причину отклонения. Проверка переноса характеризует один отложенный станок."
-    )
-
-    # Сравнение строится по меткам и решениям тех же моделей, что в таблице переноса.
-    anomaly_indices = [i for i in moved if records[i].label == 1]
-    misses = {
-        name: {
-            i
-            for i, predicted in zip(moved, transfer[name].prediction)
-            if records[i].label == 1 and predicted == 0
-        }
-        for name in (FOREST, "kNN")
-    }
-    operations = sorted({records[i].operation for i in misses[FOREST] | misses["kNN"]})
-    if operations:
-        rows = [["Операция", "Аномалии", "Пропуски леса", "Пропуски kNN"]]
-        for operation in operations:
-            files = {i for i in anomaly_indices if records[i].operation == operation}
-            rows.append(
-                [
-                    operation,
-                    len(files),
-                    len(files & misses[FOREST]),
-                    len(files & misses["kNN"]),
-                ]
-            )
-        report.table(
-            "Пропуски случайного леса и kNN по операциям на M03",
-            rows,
-            [38, 38, 47, 47],
-            "Операции с пропущенными аномалиями приведены в таблице {n}.",
-        )
-        common = misses[FOREST] & misses["kNN"]
-        if common:
-            names = ", ".join(sorted({records[i].operation for i in common}))
-            report.p(
-                f"Обе модели пропустили одни и те же записи в операциях {names} "
-                f"({len(common)}). При следующей проверке стоит отдельно просмотреть "
-                "аномальные записи этих операций. По имеющимся меткам нельзя установить "
-                "физическую причину пропуска."
-            )
-
-    report.section("ЗАКЛЮЧЕНИЕ")
-    _, baseline_fp, _, baseline_tp = transfer[winner].matrix.ravel()
-    report.p(
-        f"При жёстком лимите {TRANSFER_REVIEW_FRACTION:.0%} предлагаем случайный лес "
-        "с порогом, который рассчитывается заново по оценкам каждой партии. "
-        f"На M03 он дал {forest_review_tp + forest_review_fp} просмотра при лимите "
-        f"{max_reviews}, обнаружил {forest_review_tp} из {forest_review_tp + forest_review_fn} "
-        f"аномалий и вызвал {forest_review_fp} ложных тревог. Бустинг нашёл "
-        f"{boost_review_tp} аномалий при {boost_review_fp} ложных тревогах."
-    )
-    report.p(
-        f"Если допустима более длинная очередь, можно проверить лес с фиксированным "
-        f"порогом {choices[FOREST].threshold:.3f}. На M03 он дал "
-        f"{forest_tp + forest_fp} просмотров при лимите {max_reviews} и обнаружил "
-        f"{forest_tp} из {forest_tp + forest_fn} аномалий. При этом лес дал "
-        f"{forest_fp} ложных тревог. Исходная модель «{winner}» выявила "
-        f"{baseline_tp} аномалий при {baseline_fp} ложных тревогах. "
-        "Оба режима отбора лесом следует подтвердить на следующем станке."
-    )
-    early_ap = early_test[time_winner].metrics["AP"]
-    late_ap = later[time_winner].metrics["AP"]
-    _, alarms, _, detected = later[time_winner].matrix.ravel()
-    svm_early = early_test["SVM"].metrics["AP"]
-    svm_late = later["SVM"].metrics["AP"]
-    forest_early = early_test[FOREST].metrics["AP"]
-    forest_late = later[FOREST].metrics["AP"]
-    report.p(
-        f"При переносе во времени AP модели «{time_winner}», выбранной по ранним записям, "
-        f"изменилась с {early_ap:.3f} до {late_ap:.3f}. В августе она обнаружила "
-        f"{detected} из {late_bad} аномалий, число ложных тревог — {alarms}. "
-        f"У SVM AP изменилась с {svm_early:.3f} до {svm_late:.3f}. "
-        f"У случайного леса AP изменилась с {forest_early:.3f} до {forest_late:.3f}. "
-        f"Для следующей временной проверки предложен лес с прежним порогом. "
-        f"В августе он пропустил {later_forest_fn} из {late_bad} аномалий и дал "
-        f"{later_forest_fp} ложных тревог. Такой результат требует проверки на более "
-        "крупной выборке, где аномалии представлены на обоих станках."
-    )
-
-    report.section("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ")
-    report.p(
-        "1 Тнани М.-А., Файль М., Дипольд К. Система сбора данных для фрезерных "
-        "станков с ЧПУ. Procedia CIRP. 2022. Т. 107. С. 131–136. "
-        "DOI 10.1016/j.procir.2022.04.022."
-    )
-    report.p(
-        "2 Bosch CNC Machining Dataset. UCI Machine Learning Repository. 2022. "
-        "URL https://archive.ics.uci.edu/dataset/752/bosch+cnc+machining+dataset. "
-        "Файлы и описание: https://github.com/boschresearch/CNC_Machining. CC BY 4.0."
-    )
-    report.p(
-        "3 SciPy. Документация метода Уэлча. "
-        "URL https://docs.scipy.org/doc/scipy/reference/generated/scipy.signal.welch.html."
-    )
-    report.p(
-        "4 Scikit-learn. Документация HistGradientBoostingClassifier и метрики AP. "
-        "URL https://scikit-learn.org/stable/modules/ensemble.html."
-    )
-    report.p(
-        "5 ГОСТ 7.32-2017. Отчёт о научно-исследовательской работе. Структура и правила "
-        "оформления. Москва, Стандартинформ, 2017."
-    )
     extent.counts = (
-        f"1 кн., {report.image_count} рис., {report.table_count} табл., 5 источн., 0 прил"
+        f"1 кн., {report.image_count} рис., {report.table_count} табл., 5 источн., "
+        f"{report.appendix_count} прил"
     )
     report.save(path)
