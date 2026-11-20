@@ -8,7 +8,7 @@ from xml.sax.saxutils import escape
 
 import numpy as np
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
@@ -84,6 +84,7 @@ def styles() -> dict[str, ParagraphStyle]:
             keepWithNext=True,
         ),
         "center": ParagraphStyle("Center", parent=body, alignment=TA_CENTER, firstLineIndent=0),
+        "author": ParagraphStyle("Author", parent=body, alignment=TA_RIGHT, firstLineIndent=0),
         "title": ParagraphStyle(
             "Title",
             parent=body,
@@ -326,12 +327,13 @@ def build_report(
     report.p("Задание 2. Классификация", "center")
     report.story.append(Spacer(1, 8 * mm))
     report.p("Нормальный и аномальный режим фрезерного станка", "title")
-    report.story.append(Spacer(1, 13 * mm))
-    report.p("Клименко Георгий", "center")
-    report.story.append(Spacer(1, 104 * mm))
+    report.story.append(Spacer(1, 9 * mm))
+    report.p("Клименко Георгий", "author")
+    report.story.append(Spacer(1, 108 * mm))
     report.p("Санкт-Петербург", "center")
     report.p("2026", "center")
 
+    _, forest_fp, forest_fn, forest_tp = limited_review[FOREST].matrix.ravel()
     report.section("РЕФЕРАТ")
     extent = ReportExtent(report.style["body"])
     report.story.append(extent)
@@ -343,8 +345,9 @@ def build_report(
         f"На {len(records)} записях вибрации Bosch CNC Machining сопоставлены семь моделей "
         "для обнаружения аномалий фрезерования. Качество проверено на новых записях "
         "знакомых станков, на отложенном станке M03 и на данных августа 2021 года. "
-        "Для ручного отбора записей оценён лимит просмотра 5 % партии. "
-        "При переносе рабочие характеристики зависели от модели и правила отбора."
+        f"{winner} показала наибольшую среднюю AP на обучающих разбиениях. "
+        f"На новом станке случайный лес при лимите 5 % обнаружил {forest_tp} "
+        f"из {forest_tp + forest_fn} аномалий за {forest_tp + forest_fp} просмотра."
     )
     report.story.append(PageBreak())
     report.p("СОДЕРЖАНИЕ", "center")
@@ -369,10 +372,13 @@ def build_report(
 
     report.section("1 Данные и схема проверки")
     bad_total = sum(record.label for record in records)
+    good_total = len(records) - bad_total
+    good_share = f"{100 * good_total / len(records):.1f}".replace(".", ",")
+    bad_share = f"{100 * bad_total / len(records):.1f}".replace(".", ",")
     report.p(
-        f"Набор Bosch CNC Machining [1, 2] содержит {len(records)} записей с датчика "
-        f"ускорения по трём осям, из них {bad_total} аномальных ({bad_total / len(records):.1%}). "
-        "Одна запись соответствует одному файлу HDF5. Метки good и bad обозначают "
+        f"В наборе Bosch CNC Machining [1, 2] {good_total} нормальные записи "
+        f"({good_share} %) и {bad_total} аномальных ({bad_share} %). "
+        "Каждый файл HDF5 содержит ускорение по трём осям. Метки good и bad обозначают "
         "нормальный и аномальный процессы. Частота измерений 2000 Гц. Амплитуды показаны "
         "в единицах исходного файла."
     )
@@ -409,13 +415,16 @@ def build_report(
 
     report.section("2 Выбор модели и результаты тестов")
     report.p(
-        "Сопоставили семь классификаторов. DummyClassifier всегда предсказывает "
-        "нормальную работу. Для выбора параметров перебрали сетки на пяти стратифицированных "
-        "разбиениях обучения. Критерий выбора — средняя AP, которая показывает, насколько "
-        "высоко модель ставит аномалии в списке подозрительных записей. Порог выбирали "
-        "по максимуму F1 на проверочных частях обучения. Настройки предобработки "
-        "вычислялись внутри разбиений, включая калибровку SVM. Графики подбора "
-        "приведены в приложении А, полные метрики и матрицы ошибок — в приложении Б."
+        f"{winner} выбрали по наибольшей средней AP на обучающих разбиениях M01 и M02. "
+        "Затем модель с одним и тем же порогом проверили на обычном тесте и на "
+        "отложенном станке M03."
+    )
+    report.p(
+        "Параметры семи классификаторов подбирали по пяти стратифицированным разбиениям. "
+        "AP показывает, насколько высоко модель ставит аномалии в списке подозрительных "
+        "записей. Порог выбирали по максимуму F1, предобработку настраивали внутри "
+        "разбиений, включая калибровку SVM. Графики подбора приведены в приложении А, "
+        "полные метрики и матрицы ошибок — в приложении Б."
     )
     summary = [
         [
@@ -520,15 +529,11 @@ def build_report(
     ordinary_ap = choices[winner].scores.mean()
     forest_ap = choices[FOREST].scores.mean()
     report.p(
-        f"Для знакомых станков выбрана {winner}. Она получила наибольшую среднюю AP "
-        f"на пяти разбиениях обучающих записей M01 и M02 ({ordinary_ap:.3f} против "
-        f"{forest_ap:.3f} у случайного леса). На обычном тесте её AP составила "
-        f"{standard[winner].metrics['AP']:.3f}. На отложенном M03 AP снизилась до "
-        f"{transfer[winner].metrics['AP']:.3f}. Из {svm_tp + svm_fp} тревог "
-        f"обоснованными оказались {svm_tp} ({transfer[winner].metrics['Precision']:.1%}). "
-        "Поэтому для ручного отбора на новом станке прежний порог SVM непрактичен."
+        f"Для обычного теста на M01 и M02 выбрали {winner} по наибольшей средней AP "
+        f"на обучающих разбиениях ({ordinary_ap:.3f} против {forest_ap:.3f} у леса). "
+        f"При переносе на M03 с тем же порогом обоснованными оказались только "
+        f"{svm_tp} из {svm_tp + svm_fp} тревог."
     )
-    _, forest_fp, forest_fn, forest_tp = limited_review[FOREST].matrix.ravel()
     _, boost_fp, _, boost_tp = limited_review[BOOST].matrix.ravel()
     _, fixed_fp, _, fixed_tp = transfer[FOREST].matrix.ravel()
     report.p(
