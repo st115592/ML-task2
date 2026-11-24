@@ -514,7 +514,13 @@ def build_report(
             expected_false_alarms,
         ],
         ["Всегда тревога", len(moved), moved_bad, 0, moved_good],
-        [f"{winner}, порог обычного теста", svm_tp + svm_fp, svm_tp, moved_bad - svm_tp, svm_fp],
+        [
+            f"{winner}, порог по валидации M01/M02",
+            svm_tp + svm_fp,
+            svm_tp,
+            moved_bad - svm_tp,
+            svm_fp,
+        ],
         ["Лес, лимит 5 %", forest_tp + forest_fp, forest_tp, forest_fn, forest_fp],
     ]
     report.table(
@@ -577,8 +583,10 @@ def build_report(
         f"Для ручной проверки на новом станке по валидации M01 и M02 выбрали модель "
         f"«{transfer_label}». При лимите 5 % на M03 она нашла "
         f"{transfer_tp} из {moved_bad} аномалий за {transfer_tp + transfer_fp} просмотров. "
-        f"При том же лимите ожидание при случайном отборе равно {expected_hits}. "
-        f"Число пропусков составило {transfer_fn}, число ложных тревог — {transfer_fp}. "
+        f"При том же лимите случайный отбор дал бы в среднем лишь {expected_hits} находки. "
+        f"Правило «всегда тревога» обнаружило бы все аномалии за {len(moved)} "
+        f"просмотров и дало бы {moved_good} ложных тревог. "
+        f"При отборе моделью ложных тревог было {transfer_fp}, пропусков — {transfer_fn}. "
         "Такой отбор помогает расставить приоритеты при ручной проверке."
     )
 
