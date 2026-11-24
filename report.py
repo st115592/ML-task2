@@ -30,7 +30,6 @@ from reportlab.platypus.tableofcontents import TableOfContents
 
 from cnc_data import Recording
 from experiment import (
-    BOOST,
     FOREST,
     TRANSFER_REVIEW_FRACTION,
     Evaluation,
@@ -320,6 +319,28 @@ def build_report(
     limited_review: dict[str, Evaluation],
     limited_thresholds: dict[str, float],
 ) -> None:
+    train, test, moved = splits
+    earlier, control, late = time_indices
+    time_winner = max(time_choices, key=lambda name: time_choices[name].scores.mean())
+    transfer_name = machine_transfer.winner
+    transfer_label = "Логистическая регрессия" if transfer_name == "Лог. регр." else transfer_name
+    transfer_params = parameters(machine_transfer.choices[transfer_name].params)
+    transfer_recall = np.mean(
+        [
+            result.metrics["Recall"]
+            for result in machine_transfer.validation[transfer_name].values()
+        ]
+    )
+    _, transfer_fp, transfer_fn, transfer_tp = machine_test.matrix.ravel()
+    moved_bad = transfer_tp + transfer_fn
+    moved_good = len(moved) - moved_bad
+    max_reviews = int(len(moved) * TRANSFER_REVIEW_FRACTION)
+    # Every file has the same inclusion probability in a uniformly sampled batch.
+    random_tp = max_reviews * moved_bad / len(moved)
+    expected_hits = f"{random_tp:.2f}".replace(".", ",")
+    expected_misses = f"{moved_bad - random_tp:.2f}".replace(".", ",")
+    expected_false_alarms = f"{max_reviews - random_tp:.2f}".replace(".", ",")
+
     configure_fonts()
     report = Report(figures)
     report.p("Санкт-Петербургский государственный университет", "center")
@@ -333,7 +354,6 @@ def build_report(
     report.p("Санкт-Петербург", "center")
     report.p("2026", "center")
 
-    _, forest_fp, forest_fn, forest_tp = limited_review[FOREST].matrix.ravel()
     report.section("РЕФЕРАТ")
     extent = ReportExtent(report.style["body"])
     report.story.append(extent)
@@ -345,21 +365,16 @@ def build_report(
         f"На {len(records)} записях вибрации Bosch CNC Machining сопоставлены семь моделей "
         "для обнаружения аномалий фрезерования. Качество проверено на новых записях "
         "знакомых станков, на отложенном станке M03 и на данных августа 2021 года. "
-        f"{winner} показала наибольшую среднюю AP на обучающих разбиениях. "
-        f"На новом станке случайный лес при лимите 5 % обнаружил {forest_tp} "
-        f"из {forest_tp + forest_fn} аномалий за {forest_tp + forest_fp} просмотра."
+        f"Для обычного теста по средней AP на обучающих разбиениях выбрали {winner}. "
+        f"Для переноса по взаимной проверке M01 и M02 выбрали модель «{transfer_label}». "
+        f"На M03 она обнаружила {transfer_tp} из {moved_bad} аномалий при лимите 5 %. "
+        f"Случайный отбор в пределах того же лимита дал бы в среднем {expected_hits}."
     )
     report.story.append(PageBreak())
     report.p("СОДЕРЖАНИЕ", "center")
     toc = TableOfContents(dotsMinLevel=0)
     toc.levelStyles = [report.style["toc"]]
     report.story.append(toc)
-
-    train, test, moved = splits
-    earlier, control, late = time_indices
-    time_winner = max(time_choices, key=lambda name: time_choices[name].scores.mean())
-    transfer_name = machine_transfer.winner
-    _, transfer_fp, transfer_fn, transfer_tp = machine_test.matrix.ravel()
 
     report.section("ВВЕДЕНИЕ")
     report.p(
@@ -405,8 +420,9 @@ def build_report(
     )
     report.p(
         "Для обычного теста отложили 25 % записей M01 и M02 с сохранением доли классов. "
-        "Те же модели и пороги проверили на всех записях M03. Для проверки переноса "
-        "во времени отдельно выделили записи августа 2021 года и более ранний контрольный тест."
+        "Все записи M03 заранее отложили для проверки переноса на другой станок. "
+        "Их использовали для оценки после выбора модели и настройки отбора. "
+        "Для переноса во времени выделили август 2021 года и ранний контрольный тест."
     )
     report.p(
         "Модели получают 24 признака ускорения из каждого файла. "
@@ -415,12 +431,14 @@ def build_report(
 
     report.section("2 Выбор модели и результаты тестов")
     report.p(
-        f"{winner} выбрали по наибольшей средней AP на обучающих разбиениях M01 и M02. "
-        "Затем модель с одним и тем же порогом проверили на обычном тесте и на "
-        "отложенном станке M03."
+        f"Для обычного теста выбрали {winner} по наибольшей средней AP на обучающих "
+        "разбиениях M01 и M02. Для переноса на новый станок модель выбирали отдельно, "
+        "по взаимной проверке M01 и M02. В этом сравнении победила модель "
+        f"«{transfer_label}». Результаты её проверки на M03 приведены в разделе 3."
     )
     report.p(
-        "Параметры семи классификаторов подбирали по пяти стратифицированным разбиениям. "
+        "Для обычного теста параметры семи классификаторов подбирали по пяти "
+        "стратифицированным разбиениям. "
         "AP показывает, насколько высоко модель ставит аномалии в списке подозрительных "
         "записей. Порог выбирали по максимуму F1, предобработку настраивали внутри "
         "разбиений, включая калибровку SVM. Графики подбора приведены в приложении А, "
@@ -454,7 +472,7 @@ def build_report(
         "Параметры и результаты обычной проверки и переноса на M03",
         summary,
         [23, 52, 23, 18, 18, 18, 18],
-        "Параметры моделей и результаты обоих тестов собраны в таблице {n}.",
+        "Таблица {n} сопоставляет обычный тест и M03 при одних моделях и порогах.",
     )
     report.figure(
         "transfer",
@@ -463,42 +481,63 @@ def build_report(
     )
 
     report.section("3 Отбор записей на станке M03")
-    max_reviews = int(len(moved) * TRANSFER_REVIEW_FRACTION)
     report.p(
-        f"В эксперименте все {len(moved)} записей M03 образуют одну партию. "
-        f"Лимит {TRANSFER_REVIEW_FRACTION:.0%} допускает {max_reviews} просмотров. "
-        "В очередь попадают записи с наибольшими оценками. При совпадении оценок "
-        "на границе отбора вся группа остаётся вне очереди. Для применения на станке "
-        "размер партии предстоит определить, например по сменам."
+        "Для выбора модели переноса по очереди обучали модели на записях одного станка "
+        "из обучающей выборки M01 и M02 и проверяли на записях второго. Параметры "
+        "подбирали по средней AP. Модель выбирали по средней полноте двух проверок "
+        f"при лимите просмотров 5 %. Выиграла {transfer_label.lower()} "
+        f"({transfer_params}) со средней полнотой {transfer_recall:.1%}. "
+        "Затем её обучили на всей обучающей выборке M01 и M02 и проверили на M03."
     )
-    rows = [["Модель и правило отбора", "Просмотры", "Найдено", "Пропущено", "Ложные тревоги"]]
-    for name, evaluation in (
-        (f"{winner}, порог из обучения", transfer[winner]),
-        ("Лес, фиксированный порог", transfer[FOREST]),
-        ("kNN, фиксированный порог", transfer["kNN"]),
-        ("Лес, лимит 5 %", limited_review[FOREST]),
-        ("Бустинг, лимит 5 %", limited_review[BOOST]),
-    ):
-        _, fp, fn, tp = evaluation.matrix.ravel()
-        rows.append([name, tp + fp, tp, fn, fp])
+    report.p(
+        f"Все {len(moved)} записей M03 образуют одну партию. "
+        f"Лимит 5 % допускает {max_reviews} просмотров. В очередь попадают записи "
+        "с наибольшими оценками. При совпадении оценок на границе всю группу "
+        "оставляют вне очереди. Для работы на станке размер партии можно задать по сменам."
+    )
+    _, svm_fp, _, svm_tp = transfer[winner].matrix.ravel()
+    _, forest_fp, forest_fn, forest_tp = limited_review[FOREST].matrix.ravel()
+    rows = [
+        ["Модель и правило отбора", "Просмотры", "Найдено", "Пропущено", "Ложные тревоги"],
+        [
+            f"{transfer_label}, лимит 5 %",
+            transfer_tp + transfer_fp,
+            transfer_tp,
+            transfer_fn,
+            transfer_fp,
+        ],
+        [
+            "Случайный отбор, среднее",
+            max_reviews,
+            expected_hits,
+            expected_misses,
+            expected_false_alarms,
+        ],
+        ["Всегда тревога", len(moved), moved_bad, 0, moved_good],
+        [f"{winner}, порог обычного теста", svm_tp + svm_fp, svm_tp, moved_bad - svm_tp, svm_fp],
+        ["Лес, лимит 5 %", forest_tp + forest_fp, forest_tp, forest_fn, forest_fp],
+    ]
     report.table(
         "Нагрузка ручной проверки и ошибки на M03",
         rows,
         [57, 25, 23, 27, 33],
-        "Основные варианты отбора сопоставлены в таблице {n}.",
+        "Результаты на M03 и базовые правила отбора сопоставлены в таблице {n}.",
     )
-    _, svm_fp, _, svm_tp = transfer[winner].matrix.ravel()
+    report.p(
+        f"Случайный отбор {max_reviews} записей даёт каждой аномалии одинаковый шанс "
+        f"попасть в очередь ({max_reviews} из {len(moved)}). Модель нашла больше "
+        f"аномалий, чем ожидалось при случайном отборе, и пропустила {transfer_fn}. "
+        "Правило «всегда тревога» требует просмотра всей партии. "
+        "Лес показан для сравнения результатов на уже размеченном M03."
+    )
     normal_mask = np.array([records[i].label == 0 for i in moved])
     median = np.median(transfer[winner].scores[normal_mask])
     report.p(
-        f"На M03 медианная оценка SVM для нормальных записей составила {median:.3f} "
+        f"На M03 медианная оценка {winner} для нормальных записей составила {median:.3f} "
         f"при пороге {choices[winner].threshold:.3f}. Сдвиг оценок проявился "
         "сразу в нескольких операциях и привёл к большому числу тревог. "
-        "По данным этого эксперимента установить физическую причину сдвига нельзя."
-    )
-    report.p(
-        "Полное сравнение при лимите, отдельный подбор по взаимному переносу M01 и M02 "
-        "и пропуски по операциям приведены в приложении В."
+        "Результаты подбора на M01 и M02, полное сравнение при лимите и пропуски "
+        "по операциям приведены в приложении В."
     )
 
     report.section("4 Перенос во времени")
@@ -534,17 +573,13 @@ def build_report(
         f"При переносе на M03 с тем же порогом обоснованными оказались только "
         f"{svm_tp} из {svm_tp + svm_fp} тревог."
     )
-    _, boost_fp, _, boost_tp = limited_review[BOOST].matrix.ravel()
-    _, fixed_fp, _, fixed_tp = transfer[FOREST].matrix.ravel()
     report.p(
-        "При жёстком лимите 5 % для следующей проверки предлагаем случайный лес "
-        f"с порогом по оценкам каждой партии. На M03 он нашёл {forest_tp} из "
-        f"{forest_tp + forest_fn} аномалий за {forest_tp + forest_fp} просмотра. "
-        f"Бустинг нашёл {boost_tp} аномалий за {boost_tp + boost_fp} просмотров. "
-        f"Фиксированный порог леса {choices[FOREST].threshold:.3f} позволил найти "
-        f"{fixed_tp} аномалий, но потребовал {fixed_tp + fixed_fp} просмотров при "
-        f"лимите {max_reviews}. Рекомендация основана на сравнении на M03 и требует "
-        "проверки на другом станке."
+        f"Для ручной проверки на новом станке по валидации M01 и M02 выбрали модель "
+        f"«{transfer_label}». При лимите 5 % на M03 она нашла "
+        f"{transfer_tp} из {moved_bad} аномалий за {transfer_tp + transfer_fp} просмотров. "
+        f"При том же лимите ожидание при случайном отборе равно {expected_hits}. "
+        f"Число пропусков составило {transfer_fn}, число ложных тревог — {transfer_fp}. "
+        "Такой отбор помогает расставить приоритеты при ручной проверке."
     )
 
     report.section("СПИСОК ИСПОЛЬЗОВАННЫХ ИСТОЧНИКОВ")
@@ -714,7 +749,8 @@ def build_report(
         "Нагрузка на ручную проверку и ошибки на M03",
         rows,
         [44, 20, 22, 19, 20, 24, 21],
-        "Способы отбора на M03 сопоставлены в таблице {n}.",
+        "Таблица {n} показывает результаты сравнения на M03. Строка «по станкам» "
+        "относится к модели, выбранной по взаимной проверке M01 и M02.",
     )
     report.p(
         "* Округлённые пороги для партии M03. При лимите 5 % порог рассчитывается заново "
